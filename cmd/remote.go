@@ -30,6 +30,7 @@ import (
 	"syscall"
 
 	"github.com/mkloubert/go-proxy/internal/crypto"
+	"github.com/mkloubert/go-proxy/internal/security"
 	"github.com/mkloubert/go-proxy/internal/tunnel"
 	"github.com/spf13/cobra"
 )
@@ -49,6 +50,13 @@ environment variable (base64-encoded).`,
 		if err != nil {
 			return err
 		}
+
+		// 1b. Set up IP filter (ipsum.txt + GeoLite2 country blocking)
+		ipFilter, err := security.NewIPFilter()
+		if err != nil {
+			return fmt.Errorf("ip filter setup failed: %w", err)
+		}
+		defer ipFilter.Close()
 
 		// 2. Read flags
 		port, _ := cmd.Flags().GetInt("port")
@@ -74,6 +82,7 @@ environment variable (base64-encoded).`,
 
 		// 5. Serve
 		srv := tunnel.NewServer(secret)
+		srv.SetIPFilter(ipFilter)
 		if err := srv.Serve(ln); err != nil {
 			select {
 			case <-ctx.Done():

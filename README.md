@@ -111,9 +111,34 @@ Start the remote tunnel server.
 
 ### Environment Variables
 
-| Variable                | Description                                                           |
-| ----------------------- | --------------------------------------------------------------------- |
-| `GOPROXY_TUNNEL_SECRET` | Base64-encoded shared secret for AES-256 tunnel encryption (required) |
+| Variable                    | Description                                                                                                                |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `GOPROXY_TUNNEL_SECRET`     | Base64-encoded shared secret for AES-256 tunnel encryption (required)                                                      |
+| `GOPROXY_BLOCKED_COUNTRIES` | Comma-separated ISO country codes to block (e.g. `CN,RU,IR`). Only used when `GeoLite2.mmdb` is present. Case-insensitive. |
+
+## IP Blocking (Remote Server)
+
+The remote server can block incoming connections based on IP reputation and geolocation. Both features are optional and activate automatically when their data files are present in the working directory.
+
+### ipsum.txt (Threat Intelligence)
+
+Place an `ipsum.txt` file (from [stamparm/ipsum](https://github.com/stamparm/ipsum)) in the working directory of the remote server. IPs with a threat level of 3 or higher are blocked automatically.
+
+```bash
+# Download the latest ipsum.txt
+curl -o ipsum.txt https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt
+```
+
+### GeoLite2 Country Blocking
+
+Place a `GeoLite2.mmdb` file (from [MaxMind](https://dev.maxmind.com/geoip/geolite2-free-geolocation-data/)) in the working directory and set the `GOPROXY_BLOCKED_COUNTRIES` environment variable.
+
+```bash
+export GOPROXY_BLOCKED_COUNTRIES="CN,RU,IR"
+./go-proxy remote --port=9876
+```
+
+Country codes are [ISO 3166-1 alpha-2](https://en.wikipedia.org/wiki/ISO_3166-1_alpha-2), case-insensitive, and whitespace is trimmed.
 
 ## Security
 
@@ -122,6 +147,7 @@ Start the remote tunnel server.
 - Keys are derived using HKDF (SHA-256) with a random salt per connection.
 - A challenge/response handshake verifies both sides share the same secret.
 - The encryption key is never logged.
+- IP blocking via threat intelligence feeds and GeoIP country filtering (remote server).
 
 ## License
 

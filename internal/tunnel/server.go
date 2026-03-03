@@ -51,6 +51,7 @@ type Server struct {
 	secret      string
 	connLimiter *security.ConnLimiter
 	rateLimiter *security.RateLimiter
+	ipFilter    *security.IPFilter
 
 	// AllowPrivateIPs disables SSRF protection. Only set in tests.
 	AllowPrivateIPs bool
@@ -70,6 +71,12 @@ func (s *Server) Close() {
 	s.rateLimiter.Stop()
 }
 
+// SetIPFilter assigns an IPFilter to the server. When set, incoming
+// connections from blocked IPs are rejected before any further processing.
+func (s *Server) SetIPFilter(f *security.IPFilter) {
+	s.ipFilter = f
+}
+
 // Serve accepts connections on the given listener and handles each one
 // in a separate goroutine. It blocks until the listener is closed.
 func (s *Server) Serve(ln net.Listener) error {
@@ -82,6 +89,13 @@ func (s *Server) Serve(ln net.Listener) error {
 		}
 
 		ip, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+
+		// IP filter check — known-malicious or geo-blocked IPs are rejected immediately
+		if s.ipFilter != nil && s.ipFilter.IsBlocked(ip) {
+			slog.Debug("connection blocked by IP filter", "ip", ip)
+			conn.Close()
+			continue
+		}
 
 		// Rate limit check — blocked IPs are rejected without a goroutine
 		if !s.rateLimiter.Allow(ip) {
