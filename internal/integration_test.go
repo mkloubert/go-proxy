@@ -115,9 +115,11 @@ func startTunnelRemote(t *testing.T, secret string) string {
 	}
 
 	srv := tunnel.NewServer(secret)
+	srv.AllowPrivateIPs = true
 	go srv.Serve(ln) //nolint:errcheck
 
 	t.Cleanup(func() {
+		srv.Close()
 		ln.Close()
 	})
 

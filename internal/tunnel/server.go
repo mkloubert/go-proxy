@@ -31,12 +31,16 @@ import (
 
 	"github.com/hashicorp/yamux"
 	"github.com/mkloubert/go-proxy/internal/crypto"
+	"github.com/mkloubert/go-proxy/internal/security"
 )
 
 const (
-	// handshakeTimeout limits how long an unauthenticated connection may
-	// remain open. This prevents bots from holding goroutines indefinitely.
-	handshakeTimeout = 10 * time.Second
+	handshakeTimeout        = 10 * time.Second
+	streamHeaderTimeout     = 10 * time.Second
+	yamuxAcceptBacklog      = 128
+	yamuxStreamCloseTimeout = 60 * time.Second
+	yamuxStreamOpenTimeout  = 30 * time.Second
+	yamuxMaxStreamWindow    = 512 * 1024 // 512KB per stream
 )
 
 // Server is the remote side of the tunnel. It accepts incoming connections,
@@ -44,14 +48,26 @@ const (
 // Each stream carries a target address header followed by raw TCP data
 // that is relayed to the destination.
 type Server struct {
-	secret string
+	secret      string
+	connLimiter *security.ConnLimiter
+	rateLimiter *security.RateLimiter
+
+	// AllowPrivateIPs disables SSRF protection. Only set in tests.
+	AllowPrivateIPs bool
 }
 
 // NewServer creates a new tunnel Server with the given base64-encoded secret.
 func NewServer(secret string) *Server {
 	return &Server{
-		secret: secret,
+		secret:      secret,
+		connLimiter: security.NewConnLimiter(256),
+		rateLimiter: security.NewRateLimiter(10, 5, 5, 5*time.Minute),
 	}
+}
+
+// Close stops background goroutines.
+func (s *Server) Close() {
+	s.rateLimiter.Stop()
 }
 
 // Serve accepts connections on the given listener and handles each one
@@ -65,26 +81,40 @@ func (s *Server) Serve(ln net.Listener) error {
 			return fmt.Errorf("accept failed: %w", err)
 		}
 
-		slog.Info("new tunnel connection", "remote", conn.RemoteAddr().String())
-		go s.handleConn(conn)
+		ip, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+
+		// Rate limit check — blocked IPs are rejected without a goroutine
+		if !s.rateLimiter.Allow(ip) {
+			conn.Close()
+			continue
+		}
+
+		// Connection limit check
+		if !s.connLimiter.Acquire() {
+			conn.Close()
+			continue
+		}
+
+		go s.handleConn(conn, ip)
 	}
 }
 
 // handleConn performs the encrypted handshake, creates a yamux session,
 // and dispatches each multiplexed stream.
-func (s *Server) handleConn(conn net.Conn) {
+func (s *Server) handleConn(conn net.Conn, ip string) {
 	defer conn.Close()
+	defer s.connLimiter.Release()
 
 	// Enforce handshake deadline so unauthenticated connections
 	// (bots, scanners) cannot hold goroutines open indefinitely.
 	conn.SetDeadline(time.Now().Add(handshakeTimeout))
 
-	// Step 1: Encrypted handshake
 	// The server never sends data before the client proves knowledge of
 	// the shared secret. On failure, the connection is closed immediately
 	// with zero bytes sent — the port appears dead to the remote party.
 	encConn, err := crypto.ServerHandshake(conn, s.secret)
 	if err != nil {
+		s.rateLimiter.RecordFailure(ip)
 		slog.Debug("handshake failed", "remote", conn.RemoteAddr().String(), "error", err)
 		return
 	}
@@ -94,15 +124,22 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	slog.Info("handshake completed", "remote", conn.RemoteAddr().String())
 
-	// Step 2: Create yamux session
-	session, err := yamux.Server(encConn, nil)
+	// Create yamux session with hardened config
+	yamuxCfg := yamux.DefaultConfig()
+	yamuxCfg.AcceptBacklog = yamuxAcceptBacklog
+	yamuxCfg.StreamCloseTimeout = yamuxStreamCloseTimeout
+	yamuxCfg.StreamOpenTimeout = yamuxStreamOpenTimeout
+	yamuxCfg.MaxStreamWindowSize = yamuxMaxStreamWindow
+	yamuxCfg.LogOutput = io.Discard
+
+	session, err := yamux.Server(encConn, yamuxCfg)
 	if err != nil {
 		slog.Error("yamux session creation failed", "remote", conn.RemoteAddr().String(), "error", err)
 		return
 	}
 	defer session.Close()
 
-	// Step 3: Accept streams
+	// Accept streams
 	for {
 		stream, err := session.Accept()
 		if err != nil {
@@ -121,6 +158,9 @@ func (s *Server) handleConn(conn net.Conn) {
 // and relays data bidirectionally.
 func (s *Server) handleStream(stream net.Conn) {
 	defer stream.Close()
+
+	// Deadline for reading the target address header
+	stream.SetDeadline(time.Now().Add(streamHeaderTimeout))
 
 	// Step 1: Read target address length (2 bytes big-endian)
 	lenBuf := make([]byte, 2)
@@ -143,12 +183,22 @@ func (s *Server) handleStream(stream net.Conn) {
 	}
 
 	target := string(addrBuf)
-	slog.Debug("dialing target", "target", target)
 
-	// Step 3: Dial the target
-	targetConn, err := net.Dial("tcp4", target)
+	// Clear deadline for relay phase
+	stream.SetDeadline(time.Time{})
+
+	// Step 3: Dial the target (with SSRF protection unless disabled)
+	var targetConn net.Conn
+	var err error
+
+	if s.AllowPrivateIPs {
+		targetConn, err = net.Dial("tcp4", target)
+	} else {
+		targetConn, err = security.SafeDial(target)
+	}
+
 	if err != nil {
-		slog.Error("failed to dial target", "target", target, "error", err)
+		slog.Debug("failed to dial target", "target", target, "error", err)
 		return
 	}
 	defer targetConn.Close()

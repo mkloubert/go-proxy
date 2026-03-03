@@ -25,6 +25,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"sync"
@@ -103,8 +104,15 @@ func (c *Client) connect() error {
 		return fmt.Errorf("handshake failed: %w", err)
 	}
 
-	// Step 3: Create yamux client session
-	session, err := yamux.Client(encConn, nil)
+	// Step 3: Create yamux client session with hardened config
+	yamuxCfg := yamux.DefaultConfig()
+	yamuxCfg.AcceptBacklog = 128
+	yamuxCfg.StreamCloseTimeout = 60 * time.Second
+	yamuxCfg.StreamOpenTimeout = 30 * time.Second
+	yamuxCfg.MaxStreamWindowSize = 512 * 1024
+	yamuxCfg.LogOutput = io.Discard
+
+	session, err := yamux.Client(encConn, yamuxCfg)
 	if err != nil {
 		encConn.Close()
 		return fmt.Errorf("yamux session creation failed: %w", err)
