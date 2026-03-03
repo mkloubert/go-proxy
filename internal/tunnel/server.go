@@ -27,9 +27,16 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/hashicorp/yamux"
 	"github.com/mkloubert/go-proxy/internal/crypto"
+)
+
+const (
+	// handshakeTimeout limits how long an unauthenticated connection may
+	// remain open. This prevents bots from holding goroutines indefinitely.
+	handshakeTimeout = 10 * time.Second
 )
 
 // Server is the remote side of the tunnel. It accepts incoming connections,
@@ -68,12 +75,22 @@ func (s *Server) Serve(ln net.Listener) error {
 func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
 
+	// Enforce handshake deadline so unauthenticated connections
+	// (bots, scanners) cannot hold goroutines open indefinitely.
+	conn.SetDeadline(time.Now().Add(handshakeTimeout))
+
 	// Step 1: Encrypted handshake
+	// The server never sends data before the client proves knowledge of
+	// the shared secret. On failure, the connection is closed immediately
+	// with zero bytes sent — the port appears dead to the remote party.
 	encConn, err := crypto.ServerHandshake(conn, s.secret)
 	if err != nil {
-		slog.Error("handshake failed", "remote", conn.RemoteAddr().String(), "error", err)
+		slog.Debug("handshake failed", "remote", conn.RemoteAddr().String(), "error", err)
 		return
 	}
+
+	// Clear deadline after successful handshake
+	conn.SetDeadline(time.Time{})
 
 	slog.Info("handshake completed", "remote", conn.RemoteAddr().String())
 

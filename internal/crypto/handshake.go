@@ -36,13 +36,17 @@ const (
 
 // ClientHandshake performs the client side of the tunnel handshake.
 //
+// The client proves knowledge of the shared secret first, so the server
+// never sends data to unauthenticated connections (blackhole behavior).
+//
 // Protocol:
 //  1. Generate 32 random bytes (salt) and send them over the raw connection.
 //  2. Derive encryption keys from the shared secret and salt.
 //  3. Wrap the connection with EncryptedConn.
-//  4. Read a 32-byte challenge from the server (over encrypted conn).
-//  5. Echo the challenge back (over encrypted conn).
-//  6. Return the encrypted connection.
+//  4. Generate a 32-byte random challenge and send it (encrypted) to the server.
+//  5. Read the server's echo response (encrypted).
+//  6. Verify the response matches the challenge using constant-time comparison.
+//  7. Return the encrypted connection.
 func ClientHandshake(conn net.Conn, secretBase64 string) (net.Conn, error) {
 	// Step 1: Generate and send salt
 	salt := make([]byte, SaltSize)
@@ -66,31 +70,46 @@ func ClientHandshake(conn net.Conn, secretBase64 string) (net.Conn, error) {
 		return nil, fmt.Errorf("failed to create encrypted connection: %w", err)
 	}
 
-	// Step 4: Read challenge from server
+	// Step 4: Generate and send challenge (client proves knowledge first)
 	challenge := make([]byte, challengeSize)
-	if _, err := io.ReadFull(encConn, challenge); err != nil {
-		return nil, fmt.Errorf("failed to read challenge: %w", err)
+	if _, err := rand.Read(challenge); err != nil {
+		return nil, fmt.Errorf("failed to generate challenge: %w", err)
 	}
 
-	// Step 5: Echo challenge back
 	if _, err := encConn.Write(challenge); err != nil {
-		return nil, fmt.Errorf("failed to send challenge response: %w", err)
+		return nil, fmt.Errorf("failed to send challenge: %w", err)
 	}
 
-	// Step 6: Return encrypted connection
+	// Step 5: Read response from server
+	response := make([]byte, challengeSize)
+	if _, err := io.ReadFull(encConn, response); err != nil {
+		return nil, fmt.Errorf("failed to read challenge response: %w", err)
+	}
+
+	// Step 6: Verify response using constant-time comparison
+	if subtle.ConstantTimeCompare(challenge, response) != 1 {
+		return nil, errors.New("handshake failed: challenge response mismatch")
+	}
+
+	// Step 7: Return encrypted connection
 	return encConn, nil
 }
 
 // ServerHandshake performs the server side of the tunnel handshake.
 //
+// The server never sends data until the client has proven knowledge of the
+// shared secret. If decryption of the client's challenge fails, the connection
+// is closed immediately without any response — the port appears dead to
+// unauthorized clients.
+//
 // Protocol:
 //  1. Read 32-byte salt from the raw connection.
 //  2. Derive encryption keys from the shared secret and salt.
 //  3. Wrap the connection with EncryptedConn.
-//  4. Generate a 32-byte random challenge and send it (over encrypted conn).
-//  5. Read the response (over encrypted conn).
-//  6. Verify the response matches the challenge using constant-time comparison.
-//  7. Return the encrypted connection (or error if mismatch).
+//  4. Read the client's encrypted challenge. If decryption fails, the client
+//     does not know the secret — return error immediately (zero bytes sent).
+//  5. Echo the challenge back (encrypted) to prove server also knows the secret.
+//  6. Return the encrypted connection.
 func ServerHandshake(conn net.Conn, secretBase64 string) (net.Conn, error) {
 	// Step 1: Read salt
 	salt := make([]byte, SaltSize)
@@ -110,27 +129,19 @@ func ServerHandshake(conn net.Conn, secretBase64 string) (net.Conn, error) {
 		return nil, fmt.Errorf("failed to create encrypted connection: %w", err)
 	}
 
-	// Step 4: Generate and send challenge
+	// Step 4: Read challenge from client (AES-GCM decryption validates the secret)
 	challenge := make([]byte, challengeSize)
-	if _, err := rand.Read(challenge); err != nil {
-		return nil, fmt.Errorf("failed to generate challenge: %w", err)
+	if _, err := io.ReadFull(encConn, challenge); err != nil {
+		// Decryption failed = client does not know the secret.
+		// Return error immediately — zero bytes were sent (blackhole).
+		return nil, fmt.Errorf("failed to read client challenge: %w", err)
 	}
 
+	// Step 5: Echo challenge back (proves server also knows the secret)
 	if _, err := encConn.Write(challenge); err != nil {
-		return nil, fmt.Errorf("failed to send challenge: %w", err)
+		return nil, fmt.Errorf("failed to send challenge response: %w", err)
 	}
 
-	// Step 5: Read response
-	response := make([]byte, challengeSize)
-	if _, err := io.ReadFull(encConn, response); err != nil {
-		return nil, fmt.Errorf("failed to read challenge response: %w", err)
-	}
-
-	// Step 6: Verify response using constant-time comparison
-	if subtle.ConstantTimeCompare(challenge, response) != 1 {
-		return nil, errors.New("handshake failed: challenge response mismatch")
-	}
-
-	// Step 7: Return encrypted connection
+	// Step 6: Return encrypted connection
 	return encConn, nil
 }
