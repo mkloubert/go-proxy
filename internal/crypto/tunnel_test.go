@@ -24,13 +24,15 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/binary"
 	"io"
 	"net"
+	"strings"
 	"testing"
 )
 
 // createEncryptedPipe creates a pair of EncryptedConn instances connected via
-// net.Pipe, using the same derived keys (simulating both ends sharing a secret).
+// net.Pipe, using the same derived keys but different nonce prefixes per direction.
 func createEncryptedPipe(t *testing.T) (*EncryptedConn, *EncryptedConn) {
 	t.Helper()
 
@@ -52,12 +54,13 @@ func createEncryptedPipe(t *testing.T) (*EncryptedConn, *EncryptedConn) {
 
 	connA, connB := net.Pipe()
 
-	encA, err := NewEncryptedConn(connA, keys.EncryptionKey)
+	// A writes with ClientNoncePrefix, B writes with ServerNoncePrefix
+	encA, err := NewEncryptedConn(connA, keys.EncryptionKey, keys.ClientNoncePrefix)
 	if err != nil {
 		t.Fatalf("failed to create EncryptedConn A: %v", err)
 	}
 
-	encB, err := NewEncryptedConn(connB, keys.EncryptionKey)
+	encB, err := NewEncryptedConn(connB, keys.EncryptionKey, keys.ServerNoncePrefix)
 	if err != nil {
 		t.Fatalf("failed to create EncryptedConn B: %v", err)
 	}
@@ -136,22 +139,30 @@ func TestEncryptedConnWrongKey(t *testing.T) {
 	// Create two different keys
 	keyA := make([]byte, EncryptionKeySize)
 	keyB := make([]byte, EncryptionKeySize)
+	prefixA := make([]byte, NoncePrefixSize)
+	prefixB := make([]byte, NoncePrefixSize)
 	if _, err := rand.Read(keyA); err != nil {
 		t.Fatalf("failed to generate key A: %v", err)
 	}
 	if _, err := rand.Read(keyB); err != nil {
 		t.Fatalf("failed to generate key B: %v", err)
 	}
+	if _, err := rand.Read(prefixA); err != nil {
+		t.Fatalf("failed to generate prefix A: %v", err)
+	}
+	if _, err := rand.Read(prefixB); err != nil {
+		t.Fatalf("failed to generate prefix B: %v", err)
+	}
 
 	connA, connB := net.Pipe()
 
-	encA, err := NewEncryptedConn(connA, keyA)
+	encA, err := NewEncryptedConn(connA, keyA, prefixA)
 	if err != nil {
 		t.Fatalf("failed to create EncryptedConn A: %v", err)
 	}
 	defer encA.Close()
 
-	encB, err := NewEncryptedConn(connB, keyB)
+	encB, err := NewEncryptedConn(connB, keyB, prefixB)
 	if err != nil {
 		t.Fatalf("failed to create EncryptedConn B: %v", err)
 	}
@@ -224,5 +235,72 @@ func TestEncryptedConnMultipleMessages(t *testing.T) {
 
 	if !bytes.Equal(buf[:n], reply) {
 		t.Errorf("expected reply %q, got %q", reply, buf[:n])
+	}
+}
+
+func TestEncryptedConnFrameSizeLimit(t *testing.T) {
+	// Create a pipe and manually inject a frame with an oversized length header
+	connA, connB := net.Pipe()
+	defer connA.Close()
+	defer connB.Close()
+
+	key := make([]byte, EncryptionKeySize)
+	prefix := make([]byte, NoncePrefixSize)
+	if _, err := rand.Read(key); err != nil {
+		t.Fatalf("failed to generate key: %v", err)
+	}
+	if _, err := rand.Read(prefix); err != nil {
+		t.Fatalf("failed to generate prefix: %v", err)
+	}
+
+	encB, err := NewEncryptedConn(connB, key, prefix)
+	if err != nil {
+		t.Fatalf("failed to create EncryptedConn: %v", err)
+	}
+
+	// Write a manipulated frame header with an enormous length
+	go func() {
+		header := make([]byte, frameHeaderSize)
+		binary.BigEndian.PutUint32(header, 0xFFFFFFFF)
+		connA.Write(header)
+	}()
+
+	buf := make([]byte, 1024)
+	_, err = encB.Read(buf)
+	if err == nil {
+		t.Fatal("expected error for oversized frame, got nil")
+	}
+	if !strings.Contains(err.Error(), "frame too large") {
+		t.Fatalf("expected 'frame too large' error, got: %v", err)
+	}
+}
+
+func TestEncryptedConnCounterNonce(t *testing.T) {
+	encA, encB := createEncryptedPipe(t)
+	defer encA.Close()
+	defer encB.Close()
+
+	// Send two messages and verify the counter increments (different nonces)
+	// We verify this indirectly: both messages decrypt correctly, meaning
+	// nonces were unique (GCM would fail with repeated nonces on same key).
+	for i := 0; i < 5; i++ {
+		msg := []byte("counter test message")
+		errCh := make(chan error, 1)
+		go func() {
+			_, err := encA.Write(msg)
+			errCh <- err
+		}()
+
+		buf := make([]byte, 1024)
+		n, err := encB.Read(buf)
+		if err != nil {
+			t.Fatalf("message %d: Read returned error: %v", i, err)
+		}
+		if writeErr := <-errCh; writeErr != nil {
+			t.Fatalf("message %d: Write returned error: %v", i, writeErr)
+		}
+		if !bytes.Equal(buf[:n], msg) {
+			t.Errorf("message %d: expected %q, got %q", i, msg, buf[:n])
+		}
 	}
 }

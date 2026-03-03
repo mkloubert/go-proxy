@@ -43,14 +43,15 @@ const (
 	tunnelSecretEnvVar = "GOPROXY_TUNNEL_SECRET"
 )
 
-// DerivedKeys holds the encryption key and nonce prefix derived from a shared secret.
+// DerivedKeys holds the encryption key and nonce prefixes derived from a shared secret.
 type DerivedKeys struct {
-	EncryptionKey []byte
-	NoncePrefix   []byte
+	EncryptionKey     []byte
+	ClientNoncePrefix []byte
+	ServerNoncePrefix []byte
 }
 
-// DeriveKeys derives an encryption key and nonce prefix from a base64-encoded
-// secret and a salt using HKDF with SHA-256.
+// DeriveKeys derives an encryption key and separate client/server nonce prefixes
+// from a base64-encoded secret and a salt using HKDF with SHA-256.
 func DeriveKeys(secretBase64 string, salt []byte) (*DerivedKeys, error) {
 	secret, err := base64.StdEncoding.DecodeString(secretBase64)
 	if err != nil {
@@ -62,14 +63,20 @@ func DeriveKeys(secretBase64 string, salt []byte) (*DerivedKeys, error) {
 		return nil, fmt.Errorf("failed to derive encryption key: %w", err)
 	}
 
-	noncePrefix, err := hkdf.Key(sha256.New, secret, salt, "go-proxy-nonce-prefix", NoncePrefixSize)
+	clientNoncePrefix, err := hkdf.Key(sha256.New, secret, salt, "go-proxy-client-nonce-prefix", NoncePrefixSize)
 	if err != nil {
-		return nil, fmt.Errorf("failed to derive nonce prefix: %w", err)
+		return nil, fmt.Errorf("failed to derive client nonce prefix: %w", err)
+	}
+
+	serverNoncePrefix, err := hkdf.Key(sha256.New, secret, salt, "go-proxy-server-nonce-prefix", NoncePrefixSize)
+	if err != nil {
+		return nil, fmt.Errorf("failed to derive server nonce prefix: %w", err)
 	}
 
 	return &DerivedKeys{
-		EncryptionKey: encryptionKey,
-		NoncePrefix:   noncePrefix,
+		EncryptionKey:     encryptionKey,
+		ClientNoncePrefix: clientNoncePrefix,
+		ServerNoncePrefix: serverNoncePrefix,
 	}, nil
 }
 
@@ -81,8 +88,13 @@ func LoadSecret() (string, error) {
 		return "", errors.New("environment variable GOPROXY_TUNNEL_SECRET is not set or empty")
 	}
 
-	if _, err := base64.StdEncoding.DecodeString(secret); err != nil {
+	decoded, err := base64.StdEncoding.DecodeString(secret)
+	if err != nil {
 		return "", fmt.Errorf("GOPROXY_TUNNEL_SECRET contains invalid base64: %w", err)
+	}
+
+	if len(decoded) < 32 {
+		return "", fmt.Errorf("GOPROXY_TUNNEL_SECRET too short: need at least 32 bytes (256 bits), got %d", len(decoded))
 	}
 
 	return secret, nil

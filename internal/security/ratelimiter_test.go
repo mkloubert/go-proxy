@@ -92,6 +92,51 @@ func TestRateLimiterFailureExpiry(t *testing.T) {
 	}
 }
 
+func TestRateLimiterExponentialBackoff(t *testing.T) {
+	// Use very short block durations so the test runs fast
+	rl := NewRateLimiter(100, 100, 2, 50*time.Millisecond)
+	defer rl.Stop()
+
+	ip := "55.66.77.88"
+
+	// First block (50ms)
+	rl.RecordFailure(ip)
+	rl.RecordFailure(ip)
+
+	if rl.Allow(ip) {
+		t.Fatal("should be blocked after first set of failures")
+	}
+
+	// Wait for first block to expire (50ms)
+	time.Sleep(80 * time.Millisecond)
+
+	if !rl.Allow(ip) {
+		t.Fatal("should be allowed after first block expires")
+	}
+
+	// Second block should be longer (100ms = 50ms * 2^1)
+	rl.RecordFailure(ip)
+	rl.RecordFailure(ip)
+
+	if rl.Allow(ip) {
+		t.Fatal("should be blocked after second set of failures")
+	}
+
+	// First block duration (50ms) should NOT be enough
+	time.Sleep(70 * time.Millisecond)
+
+	if rl.Allow(ip) {
+		t.Fatal("should still be blocked during exponential backoff")
+	}
+
+	// Wait for the rest of the second block to expire
+	time.Sleep(80 * time.Millisecond)
+
+	if !rl.Allow(ip) {
+		t.Fatal("should be allowed after second block expires")
+	}
+}
+
 func TestRateLimiterStop(t *testing.T) {
 	rl := NewRateLimiter(10, 5, 5, 1*time.Minute)
 	rl.Stop()

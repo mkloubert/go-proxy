@@ -37,6 +37,7 @@ import (
 const (
 	handshakeTimeout        = 10 * time.Second
 	streamHeaderTimeout     = 10 * time.Second
+	relayIdleTimeout        = 5 * time.Minute
 	yamuxAcceptBacklog      = 128
 	yamuxStreamCloseTimeout = 60 * time.Second
 	yamuxStreamOpenTimeout  = 30 * time.Second
@@ -53,8 +54,8 @@ type Server struct {
 	rateLimiter *security.RateLimiter
 	ipFilter    *security.IPFilter
 
-	// AllowPrivateIPs disables SSRF protection. Only set in tests.
-	AllowPrivateIPs bool
+	// allowPrivateIPs disables SSRF protection. Only set in tests via SetAllowPrivateIPs.
+	allowPrivateIPs bool
 }
 
 // NewServer creates a new tunnel Server with the given base64-encoded secret.
@@ -75,6 +76,11 @@ func (s *Server) Close() {
 // connections from blocked IPs are rejected before any further processing.
 func (s *Server) SetIPFilter(f *security.IPFilter) {
 	s.ipFilter = f
+}
+
+// SetAllowPrivateIPs disables SSRF protection. Only use in tests.
+func (s *Server) SetAllowPrivateIPs(allow bool) {
+	s.allowPrivateIPs = allow
 }
 
 // Serve accepts connections on the given listener and handles each one
@@ -129,7 +135,7 @@ func (s *Server) handleConn(conn net.Conn, ip string) {
 	encConn, err := crypto.ServerHandshake(conn, s.secret)
 	if err != nil {
 		s.rateLimiter.RecordFailure(ip)
-		slog.Debug("handshake failed", "remote", conn.RemoteAddr().String(), "error", err)
+		slog.Debug("handshake failed", "remote", conn.RemoteAddr().String())
 		return
 	}
 
@@ -205,8 +211,8 @@ func (s *Server) handleStream(stream net.Conn) {
 	var targetConn net.Conn
 	var err error
 
-	if s.AllowPrivateIPs {
-		targetConn, err = net.Dial("tcp4", target)
+	if s.allowPrivateIPs {
+		targetConn, err = net.DialTimeout("tcp4", target, 30*time.Second)
 	} else {
 		targetConn, err = security.SafeDial(target)
 	}
@@ -219,8 +225,26 @@ func (s *Server) handleStream(stream net.Conn) {
 
 	slog.Debug("connected to target", "target", target)
 
-	// Step 4: Bidirectional relay
-	relay(stream, targetConn)
+	// Step 4: Bidirectional relay with idle timeout
+	relay(&activityConn{Conn: stream, timeout: relayIdleTimeout},
+		&activityConn{Conn: targetConn, timeout: relayIdleTimeout})
+}
+
+// activityConn wraps a net.Conn and refreshes deadlines on each Read/Write,
+// ensuring idle connections are closed after the configured timeout.
+type activityConn struct {
+	net.Conn
+	timeout time.Duration
+}
+
+func (c *activityConn) Read(p []byte) (int, error) {
+	c.Conn.SetReadDeadline(time.Now().Add(c.timeout))
+	return c.Conn.Read(p)
+}
+
+func (c *activityConn) Write(p []byte) (int, error) {
+	c.Conn.SetWriteDeadline(time.Now().Add(c.timeout))
+	return c.Conn.Write(p)
 }
 
 // relay copies data bidirectionally between two connections.

@@ -32,6 +32,7 @@ import (
 	"testing"
 	"time"
 
+
 	xproxy "golang.org/x/net/proxy"
 )
 
@@ -321,6 +322,71 @@ func TestProtocolDetectionHTTP(t *testing.T) {
 
 	if strings.TrimSpace(string(body)) != "hello" {
 		t.Fatalf("body mismatch: got %q, want %q", string(body), "hello")
+	}
+}
+
+func TestHTTPProxyStripsHopByHopHeaders(t *testing.T) {
+	// Start an HTTP server that echoes back received headers
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Check that hop-by-hop headers were stripped
+		hopByHop := []string{
+			"Connection", "Proxy-Connection", "Keep-Alive",
+			"Proxy-Authenticate", "Proxy-Authorization",
+			"Te", "Trailers", "Transfer-Encoding", "Upgrade",
+		}
+		for _, h := range hopByHop {
+			if v := r.Header.Get(h); v != "" {
+				w.WriteHeader(http.StatusBadRequest)
+				fmt.Fprintf(w, "hop-by-hop header %s was not stripped: %s", h, v)
+				return
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "ok")
+	}))
+	defer srv.Close()
+
+	u, _ := url.Parse(srv.URL)
+
+	proxy := NewHTTPProxy(func(target string) (net.Conn, error) {
+		return net.Dial("tcp4", target)
+	})
+
+	proxyLn, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer proxyLn.Close()
+
+	go http.Serve(proxyLn, proxy) //nolint:errcheck
+
+	// Send a request with hop-by-hop headers through the proxy
+	conn, err := net.DialTimeout("tcp", proxyLn.Addr().String(), 5*time.Second)
+	if err != nil {
+		t.Fatalf("failed to connect: %v", err)
+	}
+	defer conn.Close()
+
+	reqStr := fmt.Sprintf("GET http://%s/ HTTP/1.1\r\n"+
+		"Host: %s\r\n"+
+		"Connection: keep-alive\r\n"+
+		"Proxy-Connection: keep-alive\r\n"+
+		"Keep-Alive: timeout=5\r\n"+
+		"Proxy-Authorization: Basic dGVzdA==\r\n"+
+		"\r\n", u.Host, u.Host)
+	conn.Write([]byte(reqStr))
+
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("failed to read response: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, string(body))
 	}
 }
 

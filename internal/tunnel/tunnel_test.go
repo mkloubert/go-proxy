@@ -86,7 +86,7 @@ func startTunnelServer(t *testing.T, secret string) (string, func()) {
 	}
 
 	srv := NewServer(secret)
-	srv.AllowPrivateIPs = true
+	srv.SetAllowPrivateIPs(true)
 
 	go func() {
 		srv.Serve(ln)

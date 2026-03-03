@@ -65,7 +65,7 @@ func TestServerBlocksIPAfterFailedHandshakes(t *testing.T) {
 	}
 
 	srv := NewServer(secret)
-	srv.AllowPrivateIPs = true
+	srv.SetAllowPrivateIPs(true)
 	go srv.Serve(ln)
 	defer srv.Close()
 	defer ln.Close()

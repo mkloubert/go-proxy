@@ -24,9 +24,13 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"time"
 )
 
-const maxAddrLen = 253
+const (
+	maxAddrLen  = 253
+	dialTimeout = 30 * time.Second
+)
 
 // IsPrivateIP returns true if the IP is loopback, private, link-local,
 // multicast, or unspecified. Returns true for nil.
@@ -80,7 +84,7 @@ func SafeDial(addr string) (net.Conn, error) {
 
 	// Literal IP: already validated by ValidateTarget, dial directly
 	if ip := net.ParseIP(host); ip != nil {
-		return net.Dial("tcp4", addr)
+		return net.DialTimeout("tcp4", addr, dialTimeout)
 	}
 
 	// Hostname: resolve and validate all IPs before connecting
@@ -91,7 +95,7 @@ func SafeDial(addr string) (net.Conn, error) {
 
 	for _, ip := range ips {
 		if ip.To4() != nil && !IsPrivateIP(ip) {
-			return net.Dial("tcp4", net.JoinHostPort(ip.String(), port))
+			return net.DialTimeout("tcp4", net.JoinHostPort(ip.String(), port), dialTimeout)
 		}
 	}
 

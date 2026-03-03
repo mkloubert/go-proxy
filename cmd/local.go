@@ -54,6 +54,7 @@ environment variable (base64-encoded).`,
 		// 2. Read flags
 		port, _ := cmd.Flags().GetInt("port")
 		connectTo, _ := cmd.Flags().GetString("connect-to")
+		bindAddr, _ := cmd.Flags().GetString("bind")
 
 		// 3. Create tunnel client and connect
 		client := tunnel.NewClient(connectTo, secret)
@@ -71,7 +72,7 @@ environment variable (base64-encoded).`,
 		}
 
 		// 5. Start local proxy listener
-		ln, err := net.Listen("tcp4", fmt.Sprintf("0.0.0.0:%d", port))
+		ln, err := net.Listen("tcp4", fmt.Sprintf("%s:%d", bindAddr, port))
 		if err != nil {
 			return fmt.Errorf("listen failed: %w", err)
 		}
@@ -101,6 +102,7 @@ environment variable (base64-encoded).`,
 
 func init() {
 	localCmd.Flags().IntP("port", "p", 8080, "Port for the local proxy to listen on")
+	localCmd.Flags().StringP("bind", "b", "127.0.0.1", "Address to bind the local proxy to")
 	localCmd.Flags().StringP("connect-to", "c", "", "Remote server address in host:port format")
 	_ = localCmd.MarkFlagRequired("connect-to")
 

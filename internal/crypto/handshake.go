@@ -64,8 +64,8 @@ func ClientHandshake(conn net.Conn, secretBase64 string) (net.Conn, error) {
 		return nil, fmt.Errorf("failed to derive keys: %w", err)
 	}
 
-	// Step 3: Create encrypted connection
-	encConn, err := NewEncryptedConn(conn, keys.EncryptionKey)
+	// Step 3: Create encrypted connection (client writes with ClientNoncePrefix)
+	encConn, err := NewEncryptedConn(conn, keys.EncryptionKey, keys.ClientNoncePrefix)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create encrypted connection: %w", err)
 	}
@@ -123,8 +123,8 @@ func ServerHandshake(conn net.Conn, secretBase64 string) (net.Conn, error) {
 		return nil, fmt.Errorf("failed to derive keys: %w", err)
 	}
 
-	// Step 3: Create encrypted connection
-	encConn, err := NewEncryptedConn(conn, keys.EncryptionKey)
+	// Step 3: Create encrypted connection (server writes with ServerNoncePrefix)
+	encConn, err := NewEncryptedConn(conn, keys.EncryptionKey, keys.ServerNoncePrefix)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create encrypted connection: %w", err)
 	}

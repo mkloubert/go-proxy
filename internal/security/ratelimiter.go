@@ -28,10 +28,13 @@ import (
 	"golang.org/x/time/rate"
 )
 
+const maxBlockDuration = 1 * time.Hour
+
 type ipEntry struct {
-	limiter   *rate.Limiter
-	failures  atomic.Int32
-	blockedAt atomic.Int64 // unix nano, 0 = not blocked
+	limiter    *rate.Limiter
+	failures   atomic.Int32
+	blockedAt  atomic.Int64 // unix nano, 0 = not blocked
+	blockCount atomic.Int32 // number of times this IP has been blocked
 }
 
 // RateLimiter provides per-IP rate limiting and failed-handshake tracking.
@@ -69,10 +72,11 @@ func (rl *RateLimiter) Allow(ip string) bool {
 
 	// Check if IP is blocked due to failed handshakes
 	if blockedAt := entry.blockedAt.Load(); blockedAt > 0 {
-		if time.Now().UnixNano()-blockedAt < int64(rl.blockDuration) {
+		effectiveDuration := rl.effectiveBlockDuration(entry.blockCount.Load())
+		if time.Now().UnixNano()-blockedAt < int64(effectiveDuration) {
 			return false
 		}
-		// Block expired: reset
+		// Block expired: reset blockedAt and failures but NOT blockCount
 		entry.blockedAt.Store(0)
 		entry.failures.Store(0)
 	}
@@ -85,8 +89,22 @@ func (rl *RateLimiter) Allow(ip string) bool {
 func (rl *RateLimiter) RecordFailure(ip string) {
 	entry := rl.getOrCreate(ip)
 	if entry.failures.Add(1) >= rl.maxFailures {
+		entry.blockCount.Add(1)
 		entry.blockedAt.Store(time.Now().UnixNano())
 	}
+}
+
+// effectiveBlockDuration returns the block duration with exponential backoff
+// based on the number of times the IP has been blocked, capped at maxBlockDuration.
+func (rl *RateLimiter) effectiveBlockDuration(blockCount int32) time.Duration {
+	d := rl.blockDuration
+	for i := int32(1); i < blockCount; i++ {
+		d *= 2
+		if d >= maxBlockDuration {
+			return maxBlockDuration
+		}
+	}
+	return d
 }
 
 // Stop terminates the background cleanup goroutine.

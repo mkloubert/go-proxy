@@ -23,13 +23,13 @@ package crypto
 import (
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -50,20 +50,27 @@ const (
 // Framing protocol:
 //
 //	[4 bytes: length of nonce+ciphertext (big-endian)]
-//	[12 bytes: nonce (random per frame)]
+//	[12 bytes: nonce (prefix + counter)]
 //	[N bytes: AES-256-GCM ciphertext + 16-byte auth tag]
 type EncryptedConn struct {
-	conn    net.Conn
-	gcm     cipher.AEAD
-	writeMu sync.Mutex
-	readBuf []byte // buffered plaintext from previous Read
+	conn         net.Conn
+	gcm          cipher.AEAD
+	writeMu      sync.Mutex
+	readMu       sync.Mutex
+	readBuf      []byte // buffered plaintext from previous Read
+	noncePrefix  []byte
+	writeCounter uint64
 }
 
 // NewEncryptedConn creates a new EncryptedConn wrapping the given connection
-// with the specified AES-256 encryption key.
-func NewEncryptedConn(conn net.Conn, key []byte) (*EncryptedConn, error) {
+// with the specified AES-256 encryption key and nonce prefix for writes.
+func NewEncryptedConn(conn net.Conn, key, noncePrefix []byte) (*EncryptedConn, error) {
 	if len(key) != EncryptionKeySize {
 		return nil, fmt.Errorf("invalid key size: expected %d bytes, got %d", EncryptionKeySize, len(key))
+	}
+
+	if len(noncePrefix) != NoncePrefixSize {
+		return nil, fmt.Errorf("invalid nonce prefix size: expected %d bytes, got %d", NoncePrefixSize, len(noncePrefix))
 	}
 
 	block, err := aes.NewCipher(key)
@@ -76,9 +83,13 @@ func NewEncryptedConn(conn net.Conn, key []byte) (*EncryptedConn, error) {
 		return nil, fmt.Errorf("failed to create GCM: %w", err)
 	}
 
+	prefix := make([]byte, NoncePrefixSize)
+	copy(prefix, noncePrefix)
+
 	return &EncryptedConn{
-		conn: conn,
-		gcm:  gcm,
+		conn:        conn,
+		gcm:         gcm,
+		noncePrefix: prefix,
 	}, nil
 }
 
@@ -107,32 +118,26 @@ func (ec *EncryptedConn) Write(p []byte) (int, error) {
 	return totalWritten, nil
 }
 
-// writeFrame encrypts a single chunk and writes the framed data.
+// writeFrame encrypts a single chunk and writes the framed data atomically.
 func (ec *EncryptedConn) writeFrame(plaintext []byte) error {
-	// Generate a random nonce for this frame
+	// Build counter-based nonce: noncePrefix (4 bytes) || counter (8 bytes big-endian)
 	nonce := make([]byte, gcmNonceSize)
-	if _, err := rand.Read(nonce); err != nil {
-		return fmt.Errorf("failed to generate nonce: %w", err)
-	}
+	copy(nonce[:NoncePrefixSize], ec.noncePrefix)
+	counter := atomic.AddUint64(&ec.writeCounter, 1)
+	binary.BigEndian.PutUint64(nonce[NoncePrefixSize:], counter)
 
-	// Encrypt: nonce is prepended, ciphertext includes the auth tag
+	// Encrypt: ciphertext includes the auth tag
 	ciphertext := ec.gcm.Seal(nil, nonce, plaintext, nil)
 
-	// Frame: [4-byte length][nonce][ciphertext+tag]
-	framePayload := make([]byte, 0, len(nonce)+len(ciphertext))
-	framePayload = append(framePayload, nonce...)
-	framePayload = append(framePayload, ciphertext...)
+	// Assemble complete frame in a single buffer for atomic write
+	framePayloadLen := len(nonce) + len(ciphertext)
+	frame := make([]byte, frameHeaderSize+framePayloadLen)
+	binary.BigEndian.PutUint32(frame[:frameHeaderSize], uint32(framePayloadLen))
+	copy(frame[frameHeaderSize:], nonce)
+	copy(frame[frameHeaderSize+len(nonce):], ciphertext)
 
-	// Write length header
-	header := make([]byte, frameHeaderSize)
-	binary.BigEndian.PutUint32(header, uint32(len(framePayload)))
-
-	// Write header + payload
-	if _, err := ec.conn.Write(header); err != nil {
-		return fmt.Errorf("failed to write frame header: %w", err)
-	}
-	if _, err := ec.conn.Write(framePayload); err != nil {
-		return fmt.Errorf("failed to write frame payload: %w", err)
+	if _, err := ec.conn.Write(frame); err != nil {
+		return fmt.Errorf("failed to write frame: %w", err)
 	}
 
 	return nil
@@ -141,6 +146,9 @@ func (ec *EncryptedConn) writeFrame(plaintext []byte) error {
 // Read decrypts data from the underlying connection.
 // If buffered plaintext is available from a previous frame, it is returned first.
 func (ec *EncryptedConn) Read(p []byte) (int, error) {
+	ec.readMu.Lock()
+	defer ec.readMu.Unlock()
+
 	// Return buffered data first
 	if len(ec.readBuf) > 0 {
 		n := copy(p, ec.readBuf)
@@ -173,6 +181,12 @@ func (ec *EncryptedConn) readFrame() ([]byte, error) {
 	frameLen := binary.BigEndian.Uint32(header)
 	if frameLen < uint32(gcmNonceSize)+uint32(ec.gcm.Overhead()) {
 		return nil, errors.New("frame too small to contain nonce and auth tag")
+	}
+
+	// Upper-bound check to prevent allocation of oversized buffers
+	maxFrameWithOverhead := uint32(MaxFrameSize) + uint32(gcmNonceSize) + uint32(ec.gcm.Overhead())
+	if frameLen > maxFrameWithOverhead {
+		return nil, fmt.Errorf("frame too large: %d bytes", frameLen)
 	}
 
 	// Read the frame payload (nonce + ciphertext + tag)

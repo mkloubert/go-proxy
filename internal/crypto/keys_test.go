@@ -24,6 +24,8 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/base64"
+	"os"
+	"strings"
 	"testing"
 )
 
@@ -58,8 +60,16 @@ func TestDeriveKeys(t *testing.T) {
 		t.Errorf("expected encryption key size %d, got %d", EncryptionKeySize, len(keys.EncryptionKey))
 	}
 
-	if len(keys.NoncePrefix) != NoncePrefixSize {
-		t.Errorf("expected nonce prefix size %d, got %d", NoncePrefixSize, len(keys.NoncePrefix))
+	if len(keys.ClientNoncePrefix) != NoncePrefixSize {
+		t.Errorf("expected client nonce prefix size %d, got %d", NoncePrefixSize, len(keys.ClientNoncePrefix))
+	}
+
+	if len(keys.ServerNoncePrefix) != NoncePrefixSize {
+		t.Errorf("expected server nonce prefix size %d, got %d", NoncePrefixSize, len(keys.ServerNoncePrefix))
+	}
+
+	if bytes.Equal(keys.ClientNoncePrefix, keys.ServerNoncePrefix) {
+		t.Error("client and server nonce prefixes should differ")
 	}
 }
 
@@ -81,8 +91,12 @@ func TestDeriveKeysDeterministic(t *testing.T) {
 		t.Error("encryption keys differ for same inputs")
 	}
 
-	if !bytes.Equal(keys1.NoncePrefix, keys2.NoncePrefix) {
-		t.Error("nonce prefixes differ for same inputs")
+	if !bytes.Equal(keys1.ClientNoncePrefix, keys2.ClientNoncePrefix) {
+		t.Error("client nonce prefixes differ for same inputs")
+	}
+
+	if !bytes.Equal(keys1.ServerNoncePrefix, keys2.ServerNoncePrefix) {
+		t.Error("server nonce prefixes differ for same inputs")
 	}
 }
 
@@ -119,7 +133,45 @@ func TestDeriveKeysDifferentSalt(t *testing.T) {
 		t.Error("encryption keys should differ for different salts")
 	}
 
-	if bytes.Equal(keys1.NoncePrefix, keys2.NoncePrefix) {
-		t.Error("nonce prefixes should differ for different salts")
+	if bytes.Equal(keys1.ClientNoncePrefix, keys2.ClientNoncePrefix) {
+		t.Error("client nonce prefixes should differ for different salts")
+	}
+
+	if bytes.Equal(keys1.ServerNoncePrefix, keys2.ServerNoncePrefix) {
+		t.Error("server nonce prefixes should differ for different salts")
+	}
+}
+
+func TestLoadSecretTooShort(t *testing.T) {
+	// 1-byte secret (base64-encoded)
+	shortSecret := base64.StdEncoding.EncodeToString([]byte{0x42})
+	os.Setenv(tunnelSecretEnvVar, shortSecret)
+	defer os.Unsetenv(tunnelSecretEnvVar)
+
+	_, err := LoadSecret()
+	if err == nil {
+		t.Fatal("expected error for short secret, got nil")
+	}
+	if !strings.Contains(err.Error(), "too short") {
+		t.Fatalf("expected 'too short' error, got: %v", err)
+	}
+}
+
+func TestLoadSecretValid(t *testing.T) {
+	validSecret := make([]byte, 32)
+	if _, err := rand.Read(validSecret); err != nil {
+		t.Fatalf("failed to generate secret: %v", err)
+	}
+	secretB64 := base64.StdEncoding.EncodeToString(validSecret)
+
+	os.Setenv(tunnelSecretEnvVar, secretB64)
+	defer os.Unsetenv(tunnelSecretEnvVar)
+
+	result, err := LoadSecret()
+	if err != nil {
+		t.Fatalf("LoadSecret returned error for valid 32-byte secret: %v", err)
+	}
+	if result != secretB64 {
+		t.Errorf("expected %q, got %q", secretB64, result)
 	}
 }

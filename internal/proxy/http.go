@@ -127,6 +127,15 @@ func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	// Required by Go's Request.Write: RequestURI must be empty
 	r.RequestURI = ""
 
+	// Strip hop-by-hop headers that must not be forwarded
+	for _, h := range []string{
+		"Connection", "Proxy-Connection", "Keep-Alive",
+		"Proxy-Authenticate", "Proxy-Authorization",
+		"Te", "Trailers", "Transfer-Encoding", "Upgrade",
+	} {
+		r.Header.Del(h)
+	}
+
 	// Write the HTTP request to the target connection
 	if err := r.Write(targetConn); err != nil {
 		slog.Error("failed to write request to target", "target", target, "error", err)
