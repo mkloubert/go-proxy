@@ -94,6 +94,8 @@ func bestSize(dim int) int {
 func cryptoRandIntn(n int) int {
 	var b [8]byte
 	cryptoRand.Read(b[:])
-	rng := mathRand.New(mathRand.NewSource(int64(b[0]) | int64(b[1])<<8 | int64(b[2])<<16 | int64(b[3])<<24))
+	seed := int64(b[0]) | int64(b[1])<<8 | int64(b[2])<<16 | int64(b[3])<<24 |
+		int64(b[4])<<32 | int64(b[5])<<40 | int64(b[6])<<48 | int64(b[7])<<56
+	rng := mathRand.New(mathRand.NewSource(seed))
 	return rng.Intn(n)
 }

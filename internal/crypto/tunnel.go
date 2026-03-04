@@ -29,7 +29,6 @@ import (
 	"io"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -123,7 +122,8 @@ func (ec *EncryptedConn) writeFrame(plaintext []byte) error {
 	// Build counter-based nonce: noncePrefix (4 bytes) || counter (8 bytes big-endian)
 	nonce := make([]byte, gcmNonceSize)
 	copy(nonce[:NoncePrefixSize], ec.noncePrefix)
-	counter := atomic.AddUint64(&ec.writeCounter, 1)
+	ec.writeCounter++
+	counter := ec.writeCounter
 	binary.BigEndian.PutUint64(nonce[NoncePrefixSize:], counter)
 
 	// Encrypt: ciphertext includes the auth tag

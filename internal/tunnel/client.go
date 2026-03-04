@@ -29,6 +29,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
 	"net/http"
 	"strings"
 	"sync"
@@ -46,7 +47,15 @@ const (
 
 	// maxBackoff is the maximum retry delay for connection attempts.
 	maxBackoff = 30 * time.Second
+
+	// maxConsecutiveErrors is the number of consecutive roundTrip failures
+	// before the StegoConn is closed.
+	maxConsecutiveErrors = 10
 )
+
+// maxStegoPayload is the maximum payload that can be embedded in the
+// largest supported carrier image (1024x1024).
+var maxStegoPayload = stego.Capacity(1024, 1024)
 
 // StegoConn implements net.Conn over HTTP POST requests with PNG steganography.
 // Write() buffers data. A background sendLoop goroutine periodically flushes
@@ -70,7 +79,10 @@ type StegoConn struct {
 	closeCh   chan struct{}
 	closeOnce sync.Once
 
-	sendInterval time.Duration // how often to flush (e.g., 50ms)
+	sendInterval      time.Duration // how often to flush (e.g., 50ms)
+	consecutiveErrors int           // tracks consecutive roundTrip failures
+
+	readDeadline atomicTime
 }
 
 // Verify StegoConn implements net.Conn at compile time.
@@ -78,7 +90,8 @@ var _ net.Conn = (*StegoConn)(nil)
 
 // Read reads data from the downstream channel. If readBuf has leftover data
 // from a previous read, it is returned first. Otherwise, Read blocks until
-// data arrives on readCh or the connection is closed.
+// data arrives on readCh or the connection is closed. If a read deadline is
+// set, the read will fail with os.ErrDeadlineExceeded when the deadline expires.
 func (sc *StegoConn) Read(p []byte) (int, error) {
 	sc.readMu.Lock()
 	defer sc.readMu.Unlock()
@@ -90,7 +103,33 @@ func (sc *StegoConn) Read(p []byte) (int, error) {
 		return n, nil
 	}
 
-	// Block until data arrives or connection is closed
+	deadline := sc.readDeadline.Load()
+	if !deadline.IsZero() {
+		d := time.Until(deadline)
+		if d <= 0 {
+			return 0, os.ErrDeadlineExceeded
+		}
+		timer := time.NewTimer(d)
+		defer timer.Stop()
+		select {
+		case data, ok := <-sc.readCh:
+			if !ok || len(data) == 0 {
+				return 0, io.EOF
+			}
+			n := copy(p, data)
+			if n < len(data) {
+				sc.readBuf = make([]byte, len(data)-n)
+				copy(sc.readBuf, data[n:])
+			}
+			return n, nil
+		case <-timer.C:
+			return 0, os.ErrDeadlineExceeded
+		case <-sc.closeCh:
+			return 0, io.EOF
+		}
+	}
+
+	// No deadline set — block until data arrives or connection is closed
 	select {
 	case data, ok := <-sc.readCh:
 		if !ok || len(data) == 0 {
@@ -148,14 +187,24 @@ func (sc *StegoConn) LocalAddr() net.Addr { return dummyAddr{} }
 // RemoteAddr returns a dummy address (pipe).
 func (sc *StegoConn) RemoteAddr() net.Addr { return dummyAddr{} }
 
-// SetDeadline is a no-op for HTTP-backed connections.
-func (sc *StegoConn) SetDeadline(t time.Time) error { return nil }
+// SetDeadline sets the read deadline. Write deadlines are not meaningful
+// for StegoConn since writes are buffered and flushed asynchronously.
+func (sc *StegoConn) SetDeadline(t time.Time) error {
+	sc.readDeadline.Store(t)
+	return nil
+}
 
-// SetReadDeadline is a no-op for HTTP-backed connections.
-func (sc *StegoConn) SetReadDeadline(t time.Time) error { return nil }
+// SetReadDeadline sets the read deadline.
+func (sc *StegoConn) SetReadDeadline(t time.Time) error {
+	sc.readDeadline.Store(t)
+	return nil
+}
 
-// SetWriteDeadline is a no-op for HTTP-backed connections.
-func (sc *StegoConn) SetWriteDeadline(t time.Time) error { return nil }
+// SetWriteDeadline is a no-op for StegoConn since writes are buffered
+// and flushed asynchronously by sendLoop.
+func (sc *StegoConn) SetWriteDeadline(t time.Time) error {
+	return nil
+}
 
 // sendLoop runs as a background goroutine. On each tick it grabs the buffered
 // write data, embeds it in a PNG, POSTs it to the server, extracts the
@@ -169,10 +218,15 @@ func (sc *StegoConn) sendLoop() {
 		case <-sc.closeCh:
 			return
 		case <-ticker.C:
-			// Grab buffered write data
+			// Grab buffered write data, capped to max stego capacity
 			sc.writeMu.Lock()
 			data := sc.writeBuf
-			sc.writeBuf = nil
+			if len(data) > maxStegoPayload {
+				data = sc.writeBuf[:maxStegoPayload]
+				sc.writeBuf = sc.writeBuf[maxStegoPayload:]
+			} else {
+				sc.writeBuf = nil
+			}
 			sc.writeMu.Unlock()
 
 			// Even if data is empty, POST to poll for downstream data
@@ -183,8 +237,25 @@ func (sc *StegoConn) sendLoop() {
 			downstream, err := sc.roundTrip(data)
 			if err != nil {
 				slog.Debug("stego roundtrip error", "error", err)
+
+				// Prepend unsent data back to writeBuf so it is retried
+				if len(data) > 0 {
+					sc.writeMu.Lock()
+					sc.writeBuf = append(data, sc.writeBuf...)
+					sc.writeMu.Unlock()
+				}
+
+				sc.consecutiveErrors++
+				if sc.consecutiveErrors > maxConsecutiveErrors {
+					slog.Error("too many consecutive roundtrip errors, closing connection", "count", sc.consecutiveErrors)
+					sc.Close()
+					return
+				}
+
 				continue
 			}
+
+			sc.consecutiveErrors = 0
 
 			// Push non-empty downstream data to readCh
 			if len(downstream) > 0 {
@@ -253,6 +324,7 @@ type Client struct {
 	mu        sync.RWMutex
 	session   *yamux.Session
 	stegoConn *StegoConn
+	ctx       context.Context
 }
 
 // NewClient creates a new tunnel Client that will connect to the given
@@ -266,13 +338,18 @@ func NewClient(remoteURL, secret string) *Client {
 
 // Connect establishes a connection to the remote tunnel server with
 // exponential backoff retry. It respects context cancellation.
+// After the initial connection succeeds, a background goroutine
+// monitors the session and automatically reconnects if it dies.
 func (c *Client) Connect(ctx context.Context) error {
+	c.ctx = ctx
+
 	backoff := initialBackoff
 
 	for {
 		err := c.connect()
 		if err == nil {
 			slog.Info("tunnel connection established", "remote", c.remoteURL)
+			go c.maintainSession()
 			return nil
 		}
 
@@ -288,6 +365,57 @@ func (c *Client) Connect(ctx context.Context) error {
 		backoff *= 2
 		if backoff > maxBackoff {
 			backoff = maxBackoff
+		}
+	}
+}
+
+// maintainSession monitors the yamux session and automatically reconnects
+// when it closes. This ensures the tunnel survives transient failures.
+func (c *Client) maintainSession() {
+	for {
+		c.mu.RLock()
+		session := c.session
+		c.mu.RUnlock()
+
+		if session == nil {
+			return
+		}
+
+		// Wait for session to close or context cancellation
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-session.CloseChan():
+			slog.Warn("tunnel session closed, reconnecting...", "remote", c.remoteURL)
+		}
+
+		// Reconnect with exponential backoff
+		backoff := initialBackoff
+		for {
+			select {
+			case <-c.ctx.Done():
+				return
+			default:
+			}
+
+			err := c.connect()
+			if err == nil {
+				slog.Info("tunnel reconnected", "remote", c.remoteURL)
+				break
+			}
+
+			slog.Error("reconnect failed", "remote", c.remoteURL, "error", err, "retry_in", backoff)
+
+			select {
+			case <-c.ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
 		}
 	}
 }

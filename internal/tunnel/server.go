@@ -21,13 +21,17 @@
 package tunnel
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -52,6 +56,7 @@ const (
 	downstreamDrainWait = 200 * time.Millisecond
 	maxDrainSize        = 512 * 1024 // 512KB
 	upstreamSendTimeout = 5 * time.Second
+	pipeWriteTimeout    = 10 * time.Second
 )
 
 // dummyAddr implements net.Addr for pipeConn.
@@ -59,6 +64,24 @@ type dummyAddr struct{}
 
 func (dummyAddr) Network() string { return "pipe" }
 func (dummyAddr) String() string  { return "pipe" }
+
+// atomicTime provides goroutine-safe access to a time.Time value.
+type atomicTime struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (a *atomicTime) Store(t time.Time) {
+	a.mu.Lock()
+	a.t = t
+	a.mu.Unlock()
+}
+
+func (a *atomicTime) Load() time.Time {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.t
+}
 
 // pipeConn implements net.Conn over channels, bridging HTTP handlers
 // and yamux/EncryptedConn. The HTTP handler writes incoming data to
@@ -70,6 +93,10 @@ type pipeConn struct {
 	downstream chan []byte // Write() pushes here, HTTP handler drains this
 	closeCh    chan struct{}
 	closeOnce  sync.Once
+
+	// Deadline support
+	readDeadline  atomicTime
+	writeDeadline atomicTime
 }
 
 // newPipeConn creates a pipeConn with buffered channels.
@@ -83,7 +110,8 @@ func newPipeConn() *pipeConn {
 
 // Read blocks on the upstream channel and returns data to the caller
 // (yamux/EncryptedConn). Leftover data from a previous read is returned
-// first.
+// first. If a read deadline is set, the read will fail with
+// os.ErrDeadlineExceeded when the deadline expires.
 func (p *pipeConn) Read(buf []byte) (int, error) {
 	p.readMu.Lock()
 	defer p.readMu.Unlock()
@@ -94,6 +122,33 @@ func (p *pipeConn) Read(buf []byte) (int, error) {
 		return n, nil
 	}
 
+	deadline := p.readDeadline.Load()
+	if !deadline.IsZero() {
+		d := time.Until(deadline)
+		if d <= 0 {
+			return 0, os.ErrDeadlineExceeded
+		}
+		timer := time.NewTimer(d)
+		defer timer.Stop()
+		select {
+		case data, ok := <-p.upstream:
+			if !ok || len(data) == 0 {
+				return 0, io.EOF
+			}
+			n := copy(buf, data)
+			if n < len(data) {
+				p.readBuf = make([]byte, len(data)-n)
+				copy(p.readBuf, data[n:])
+			}
+			return n, nil
+		case <-timer.C:
+			return 0, os.ErrDeadlineExceeded
+		case <-p.closeCh:
+			return 0, io.EOF
+		}
+	}
+
+	// No deadline set
 	select {
 	case data, ok := <-p.upstream:
 		if !ok || len(data) == 0 {
@@ -120,6 +175,8 @@ func (p *pipeConn) Write(data []byte) (int, error) {
 		return len(data), nil
 	case <-p.closeCh:
 		return 0, io.ErrClosedPipe
+	case <-time.After(pipeWriteTimeout):
+		return 0, fmt.Errorf("pipeConn: write timeout")
 	}
 }
 
@@ -135,14 +192,24 @@ func (p *pipeConn) LocalAddr() net.Addr { return dummyAddr{} }
 // RemoteAddr returns a dummy address (pipe).
 func (p *pipeConn) RemoteAddr() net.Addr { return dummyAddr{} }
 
-// SetDeadline is a no-op for HTTP-backed connections.
-func (p *pipeConn) SetDeadline(t time.Time) error { return nil }
+// SetDeadline sets both the read and write deadlines.
+func (p *pipeConn) SetDeadline(t time.Time) error {
+	p.readDeadline.Store(t)
+	p.writeDeadline.Store(t)
+	return nil
+}
 
-// SetReadDeadline is a no-op for HTTP-backed connections.
-func (p *pipeConn) SetReadDeadline(t time.Time) error { return nil }
+// SetReadDeadline sets the read deadline.
+func (p *pipeConn) SetReadDeadline(t time.Time) error {
+	p.readDeadline.Store(t)
+	return nil
+}
 
-// SetWriteDeadline is a no-op for HTTP-backed connections.
-func (p *pipeConn) SetWriteDeadline(t time.Time) error { return nil }
+// SetWriteDeadline sets the write deadline.
+func (p *pipeConn) SetWriteDeadline(t time.Time) error {
+	p.writeDeadline.Store(t)
+	return nil
+}
 
 // Verify pipeConn implements net.Conn at compile time.
 var _ net.Conn = (*pipeConn)(nil)
@@ -302,10 +369,11 @@ func (s *Server) handleHandshake(w http.ResponseWriter, payload []byte, ip strin
 		return
 	}
 
-	// 5. Generate session token
+	// 5. Generate session token and derive auth tag
 	token := generateToken()
+	authTag := deriveAuthTag(keys.EncryptionKey, token)
 
-	// 6. Store session
+	// 6. Store session (keyed by authTag so raw token never appears on the wire)
 	sess := &tunnelSession{
 		keys:     keys,
 		pipe:     pipe,
@@ -313,11 +381,11 @@ func (s *Server) handleHandshake(w http.ResponseWriter, payload []byte, ip strin
 		lastSeen: time.Now(),
 	}
 	s.sessionMu.Lock()
-	s.sessions[token] = sess
+	s.sessions[authTag] = sess
 	s.sessionMu.Unlock()
 
 	// 7. Start yamux stream accept goroutine
-	go s.acceptStreams(sess, token)
+	go s.acceptStreams(sess, authTag)
 
 	// 8. Start session cleanup goroutine (only once)
 	s.cleanupOnce.Do(func() {
@@ -335,11 +403,11 @@ func (s *Server) handleHandshake(w http.ResponseWriter, payload []byte, ip strin
 
 	// 10. Send response
 	w.Header().Set("Content-Type", "image/png")
-	w.Header().Set("Authorization", "Bearer "+token)
+	w.Header().Set("Authorization", "Bearer "+authTag)
 	w.WriteHeader(http.StatusCreated)
 	w.Write(pngBytes)
 
-	slog.Info("handshake completed, session created", "token_prefix", token[:8])
+	slog.Info("handshake completed, session created", "token_prefix", authTag[:8])
 }
 
 // handleDataExchange processes a data exchange request: pushes upstream
@@ -361,12 +429,17 @@ func (s *Server) handleDataExchange(w http.ResponseWriter, upstreamData []byte, 
 	sess.lastSeen = time.Now()
 	sess.mu.Unlock()
 
-	// 3. Push upstream data to pipeConn (non-blocking with timeout)
+	// 3. Push upstream data to pipeConn (close-aware with timeout)
 	if len(upstreamData) > 0 {
 		select {
 		case sess.pipe.upstream <- upstreamData:
+			// OK
+		case <-sess.pipe.closeCh:
+			http.Error(w, "Not Found", http.StatusNotFound)
+			return
 		case <-time.After(upstreamSendTimeout):
-			slog.Debug("upstream channel full, dropping data")
+			http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
+			return
 		}
 	}
 
@@ -552,6 +625,14 @@ func generateToken() string {
 		panic("tunnel: failed to generate token: " + err.Error())
 	}
 	return hex.EncodeToString(b)
+}
+
+// deriveAuthTag computes HMAC-SHA256(key, token) and returns it as a hex string.
+// This prevents network observers from forging session tokens.
+func deriveAuthTag(key []byte, token string) string {
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(token))
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 // sessionCleanupLoop periodically removes idle sessions.
