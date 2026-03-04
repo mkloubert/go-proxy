@@ -24,7 +24,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -61,14 +61,14 @@ environment variable (base64-encoded).`,
 		// 2. Read flags
 		port, _ := cmd.Flags().GetInt("port")
 
-		// 3. Start TCP listener
-		ln, err := net.Listen("tcp4", fmt.Sprintf("0.0.0.0:%d", port))
-		if err != nil {
-			return fmt.Errorf("listen failed: %w", err)
-		}
-		defer ln.Close()
+		// 3. Create tunnel server and HTTP server
+		srv := tunnel.NewServer(secret)
+		srv.SetIPFilter(ipFilter)
 
-		slog.Info("remote server started", "address", ln.Addr().String())
+		httpServer := &http.Server{
+			Addr:    fmt.Sprintf("0.0.0.0:%d", port),
+			Handler: srv.Handler(),
+		}
 
 		// 4. Graceful shutdown
 		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -77,19 +77,14 @@ environment variable (base64-encoded).`,
 		go func() {
 			<-ctx.Done()
 			slog.Info("shutting down remote server")
-			ln.Close()
+			httpServer.Shutdown(context.Background())
+			srv.Close()
 		}()
 
-		// 5. Serve
-		srv := tunnel.NewServer(secret)
-		srv.SetIPFilter(ipFilter)
-		if err := srv.Serve(ln); err != nil {
-			select {
-			case <-ctx.Done():
-				return nil
-			default:
-				return err
-			}
+		// 5. Start HTTP server
+		slog.Info("remote server started", "address", httpServer.Addr)
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			return err
 		}
 		return nil
 	},

@@ -103,7 +103,7 @@ environment variable (base64-encoded).`,
 func init() {
 	localCmd.Flags().IntP("port", "p", 8080, "Port for the local proxy to listen on")
 	localCmd.Flags().StringP("bind", "b", "127.0.0.1", "Address to bind the local proxy to")
-	localCmd.Flags().StringP("connect-to", "c", "", "Remote server address in host:port format")
+	localCmd.Flags().StringP("connect-to", "c", "", "Remote server URL (e.g., http://example.com:80)")
 	_ = localCmd.MarkFlagRequired("connect-to")
 
 	rootCmd.AddCommand(localCmd)

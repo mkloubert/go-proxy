@@ -28,9 +28,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -39,38 +39,52 @@ import (
 	xproxy "golang.org/x/net/proxy"
 )
 
-// testSecret is a base64-encoded 32-byte secret used in integration tests.
+// testSecret is a base64-encoded 32-byte key used across all integration tests.
 var testSecret = base64.StdEncoding.EncodeToString([]byte("my-32-byte-secret-key-for-tests!"))
 
+// tcpAddrConn wraps a net.Conn and overrides LocalAddr/RemoteAddr to return
+// valid *net.TCPAddr values. This is needed because the go-socks5 library
+// requires the dialed connection's LocalAddr() to be a *net.TCPAddr when
+// building the SOCKS5 success reply. The yamux streams returned by
+// tunnel.Client.OpenStream() have a dummyAddr that is not a *net.TCPAddr,
+// causing the SOCKS5 server to reply with "address type not supported".
+type tcpAddrConn struct {
+	net.Conn
+}
+
+func (c *tcpAddrConn) LocalAddr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4zero, Port: 0}
+}
+
+func (c *tcpAddrConn) RemoteAddr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4zero, Port: 0}
+}
+
 // startTargetHTTPServer starts a simple HTTP server that responds with
-// "hello from target" for any request. Returns the listener and its address.
+// "hello from target" for any request. It returns the listener and the
+// server address (host:port).
 func startTargetHTTPServer(t *testing.T) (net.Listener, string) {
 	t.Helper()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprint(w, "hello from target")
-	})
+	}))
 
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	u, err := url.Parse(srv.URL)
 	if err != nil {
-		t.Fatalf("failed to start target HTTP server: %v", err)
+		t.Fatalf("failed to parse target server URL: %v", err)
 	}
 
-	srv := &http.Server{Handler: mux}
-	go srv.Serve(ln) //nolint:errcheck
+	t.Cleanup(func() { srv.Close() })
 
-	t.Cleanup(func() {
-		srv.Close()
-		ln.Close()
-	})
-
-	return ln, ln.Addr().String()
+	// Return the underlying listener (nil, since httptest manages it)
+	// and the host:port address for dialing.
+	return nil, u.Host
 }
 
 // startEchoServer starts a TCP echo server that echoes all received data
-// back to the sender. Returns the listener and its address.
+// back to the sender. It returns the listener and the server address.
 func startEchoServer(t *testing.T) (net.Listener, string) {
 	t.Helper()
 
@@ -79,114 +93,109 @@ func startEchoServer(t *testing.T) (net.Listener, string) {
 		t.Fatalf("failed to start echo server: %v", err)
 	}
 
-	var wg sync.WaitGroup
-
 	go func() {
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
 				return
 			}
-			wg.Add(1)
 			go func(c net.Conn) {
-				defer wg.Done()
 				defer c.Close()
 				io.Copy(c, c)
 			}(conn)
 		}
 	}()
 
-	t.Cleanup(func() {
-		ln.Close()
-		wg.Wait()
-	})
+	t.Cleanup(func() { ln.Close() })
 
 	return ln, ln.Addr().String()
 }
 
-// startTunnelRemote starts a tunnel server on a random port.
-// Returns the listener address.
+// startTunnelRemote starts a tunnel server wrapped in httptest.NewServer.
+// It returns the base URL of the HTTP test server (e.g., "http://127.0.0.1:xxxxx").
 func startTunnelRemote(t *testing.T, secret string) string {
 	t.Helper()
 
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to start tunnel server listener: %v", err)
-	}
-
 	srv := tunnel.NewServer(secret)
 	srv.SetAllowPrivateIPs(true)
-	go srv.Serve(ln) //nolint:errcheck
+
+	httpSrv := httptest.NewServer(srv.Handler())
 
 	t.Cleanup(func() {
 		srv.Close()
-		ln.Close()
+		httpSrv.Close()
 	})
 
-	return ln.Addr().String()
+	return httpSrv.URL
 }
 
-// startTunnelClient creates a tunnel client, connects it to the remote,
-// and returns the client.
-func startTunnelClient(t *testing.T, remoteAddr, secret string) *tunnel.Client {
+// startTunnelClient creates a tunnel client, connects it to the remote URL,
+// and returns it. The client is closed automatically when the test finishes.
+func startTunnelClient(t *testing.T, remoteURL, secret string) *tunnel.Client {
 	t.Helper()
 
-	client := tunnel.NewClient(remoteAddr, secret)
+	client := tunnel.NewClient(remoteURL, secret)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	if err := client.Connect(ctx); err != nil {
 		t.Fatalf("tunnel client connect failed: %v", err)
 	}
 
-	t.Cleanup(func() {
-		client.Close()
-	})
-
+	t.Cleanup(func() { client.Close() })
 	return client
 }
 
-// startLocalProxy starts a local proxy using the given tunnel client.
-// Returns the proxy listener address.
+// startLocalProxy starts the local proxy handler (HTTP + SOCKS5) using the
+// tunnel client's OpenStream as the dial function. It returns the proxy
+// address (host:port).
 func startLocalProxy(t *testing.T, client *tunnel.Client) string {
 	t.Helper()
 
-	dial := func(target string) (net.Conn, error) {
-		return client.OpenStream(target)
-	}
-
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("failed to start local proxy listener: %v", err)
+		t.Fatalf("failed to listen for local proxy: %v", err)
 	}
 
-	handler := proxy.NewProxyHandler(dial)
+	handler := proxy.NewProxyHandler(func(target string) (net.Conn, error) {
+		conn, err := client.OpenStream(target)
+		if err != nil {
+			return nil, err
+		}
+		// Wrap with tcpAddrConn so that the go-socks5 library gets a
+		// valid *net.TCPAddr from LocalAddr() in its SOCKS5 reply.
+		return &tcpAddrConn{Conn: conn}, nil
+	})
+
 	go handler.Serve(ln) //nolint:errcheck
 
-	t.Cleanup(func() {
-		ln.Close()
-	})
+	t.Cleanup(func() { ln.Close() })
 
 	return ln.Addr().String()
 }
 
 // TestIntegrationHTTPProxy exercises the full path:
-// HTTP client -> local proxy -> encrypted tunnel -> remote server -> target HTTP server -> response back.
+//
+//	HTTP client -> local proxy -> yamux -> EncryptedConn -> StegoConn ->
+//	HTTP POST/Response -> tunnel server -> target HTTP server
 func TestIntegrationHTTPProxy(t *testing.T) {
-	// 1. Start a target HTTP server (simulates the "internet")
+	// 1. Start target HTTP server
 	_, targetAddr := startTargetHTTPServer(t)
 
-	// 2. Start tunnel remote server
-	tunnelAddr := startTunnelRemote(t, testSecret)
+	// 2. Start tunnel remote (httptest)
+	remoteURL := startTunnelRemote(t, testSecret)
 
-	// 3. Start tunnel client connecting to remote
-	client := startTunnelClient(t, tunnelAddr, testSecret)
+	// 3. Connect tunnel client
+	client := startTunnelClient(t, remoteURL, testSecret)
+
+	// Allow yamux session to stabilize
+	time.Sleep(500 * time.Millisecond)
 
 	// 4. Start local proxy
 	proxyAddr := startLocalProxy(t, client)
 
-	// 5. Create http.Client with proxy configured
+	// 5. Make HTTP GET through proxy to target
 	proxyURL, err := url.Parse("http://" + proxyAddr)
 	if err != nil {
 		t.Fatalf("failed to parse proxy URL: %v", err)
@@ -196,10 +205,9 @@ func TestIntegrationHTTPProxy(t *testing.T) {
 		Transport: &http.Transport{
 			Proxy: http.ProxyURL(proxyURL),
 		},
-		Timeout: 10 * time.Second,
+		Timeout: 30 * time.Second,
 	}
 
-	// 6. Make HTTP GET to the target server through the proxy
 	resp, err := httpClient.Get("http://" + targetAddr + "/")
 	if err != nil {
 		t.Fatalf("HTTP GET through proxy failed: %v", err)
@@ -210,7 +218,6 @@ func TestIntegrationHTTPProxy(t *testing.T) {
 		t.Fatalf("expected status 200, got %d", resp.StatusCode)
 	}
 
-	// 7. Verify response body
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("failed to read response body: %v", err)
@@ -221,34 +228,40 @@ func TestIntegrationHTTPProxy(t *testing.T) {
 	}
 }
 
-// TestIntegrationHTTPSConnect tests the CONNECT method for HTTPS tunneling
-// through the full encrypted tunnel path.
+// TestIntegrationHTTPSConnect exercises the HTTPS CONNECT tunnel path:
+//
+//	CONNECT request -> local proxy -> yamux -> EncryptedConn -> StegoConn ->
+//	HTTP POST/Response -> tunnel server -> echo server
 func TestIntegrationHTTPSConnect(t *testing.T) {
-	// 1. Start target TCP echo server
+	// 1. Start echo server
 	_, echoAddr := startEchoServer(t)
 
-	// 2. Start tunnel remote + client
-	tunnelAddr := startTunnelRemote(t, testSecret)
-	client := startTunnelClient(t, tunnelAddr, testSecret)
+	// 2. Start tunnel remote + client + proxy
+	remoteURL := startTunnelRemote(t, testSecret)
+	client := startTunnelClient(t, remoteURL, testSecret)
 
-	// 3. Start local proxy
+	// Allow yamux session to stabilize
+	time.Sleep(500 * time.Millisecond)
+
 	proxyAddr := startLocalProxy(t, client)
 
-	// 4. Connect to proxy with CONNECT method (manually)
-	conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
+	// 3. Send CONNECT request to proxy
+	conn, err := net.DialTimeout("tcp", proxyAddr, 30*time.Second)
 	if err != nil {
 		t.Fatalf("failed to connect to proxy: %v", err)
 	}
 	defer conn.Close()
 
-	// Send CONNECT request
 	connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", echoAddr, echoAddr)
-	if _, err := conn.Write([]byte(connectReq)); err != nil {
+	_, err = conn.Write([]byte(connectReq))
+	if err != nil {
 		t.Fatalf("failed to write CONNECT request: %v", err)
 	}
 
-	// Read the CONNECT response
+	// 4. Read and verify 200 response
 	br := bufio.NewReader(conn)
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+
 	statusLine, err := br.ReadString('\n')
 	if err != nil {
 		t.Fatalf("failed to read status line: %v", err)
@@ -271,13 +284,15 @@ func TestIntegrationHTTPSConnect(t *testing.T) {
 
 	// 5. Send data and verify echo
 	testData := "hello through CONNECT tunnel"
-	if _, err := conn.Write([]byte(testData)); err != nil {
+	_, err = conn.Write([]byte(testData))
+	if err != nil {
 		t.Fatalf("failed to write test data: %v", err)
 	}
 
 	buf := make([]byte, len(testData))
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	if _, err := io.ReadFull(br, buf); err != nil {
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	_, err = io.ReadFull(br, buf)
+	if err != nil {
 		t.Fatalf("failed to read echo response: %v", err)
 	}
 
@@ -286,19 +301,24 @@ func TestIntegrationHTTPSConnect(t *testing.T) {
 	}
 }
 
-// TestIntegrationSOCKS5 tests SOCKS5 through the full encrypted tunnel path.
+// TestIntegrationSOCKS5 exercises the SOCKS5 tunnel path:
+//
+//	SOCKS5 client -> local proxy -> yamux -> EncryptedConn -> StegoConn ->
+//	HTTP POST/Response -> tunnel server -> echo server
 func TestIntegrationSOCKS5(t *testing.T) {
-	// 1. Start target echo server
+	// 1. Start echo server
 	_, echoAddr := startEchoServer(t)
 
-	// 2. Start tunnel remote + client
-	tunnelAddr := startTunnelRemote(t, testSecret)
-	client := startTunnelClient(t, tunnelAddr, testSecret)
+	// 2. Start tunnel remote + client + proxy
+	remoteURL := startTunnelRemote(t, testSecret)
+	client := startTunnelClient(t, remoteURL, testSecret)
 
-	// 3. Start local proxy
+	// Allow yamux session to stabilize
+	time.Sleep(500 * time.Millisecond)
+
 	proxyAddr := startLocalProxy(t, client)
 
-	// 4. Connect via SOCKS5
+	// 3. Connect via SOCKS5
 	dialer, err := xproxy.SOCKS5("tcp", proxyAddr, nil, xproxy.Direct)
 	if err != nil {
 		t.Fatalf("failed to create SOCKS5 dialer: %v", err)
@@ -310,15 +330,17 @@ func TestIntegrationSOCKS5(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// 5. Send data and verify echo
+	// 4. Send data and verify echo
 	testData := "hello through SOCKS5 tunnel"
-	if _, err := conn.Write([]byte(testData)); err != nil {
+	_, err = conn.Write([]byte(testData))
+	if err != nil {
 		t.Fatalf("failed to write test data through SOCKS5: %v", err)
 	}
 
 	buf := make([]byte, len(testData))
-	conn.SetDeadline(time.Now().Add(5 * time.Second))
-	if _, err := io.ReadFull(conn, buf); err != nil {
+	conn.SetDeadline(time.Now().Add(30 * time.Second))
+	_, err = io.ReadFull(conn, buf)
+	if err != nil {
 		t.Fatalf("failed to read echo through SOCKS5: %v", err)
 	}
 

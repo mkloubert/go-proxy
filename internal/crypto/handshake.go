@@ -21,6 +21,8 @@
 package crypto
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/rand"
 	"crypto/subtle"
 	"errors"
@@ -144,4 +146,140 @@ func ServerHandshake(conn net.Conn, secretBase64 string) (net.Conn, error) {
 
 	// Step 6: Return encrypted connection
 	return encConn, nil
+}
+
+// buildNonce constructs a 12-byte AES-GCM nonce from a 4-byte prefix
+// followed by 8 zero bytes.
+func buildNonce(prefix []byte) []byte {
+	nonce := make([]byte, 12)
+	copy(nonce, prefix)
+	return nonce
+}
+
+// newGCM creates an AES-256-GCM cipher from the given 32-byte key.
+func newGCM(key []byte) (cipher.AEAD, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create AES cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create GCM: %w", err)
+	}
+	return gcm, nil
+}
+
+// ClientHandshakePayload generates the client-side handshake payload for
+// HTTP-based tunneling. Unlike ClientHandshake, this function does not
+// operate on a streaming connection but returns discrete byte slices
+// suitable for embedding in HTTP request/response bodies.
+//
+// Returns:
+//   - payload: salt(32) || encryptedChallenge (including GCM auth tag)
+//   - challengePlain: the original 32-byte challenge for later verification
+//   - keys: the derived keys for subsequent operations
+func ClientHandshakePayload(secretBase64 string) (payload []byte, challengePlain []byte, keys *DerivedKeys, err error) {
+	// Generate random salt
+	salt := make([]byte, SaltSize)
+	if _, err = rand.Read(salt); err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to generate salt: %w", err)
+	}
+
+	// Derive keys from shared secret and salt
+	keys, err = DeriveKeys(secretBase64, salt)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to derive keys: %w", err)
+	}
+
+	// Create AES-256-GCM cipher
+	gcm, err := newGCM(keys.EncryptionKey)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	// Generate random challenge
+	challengePlain = make([]byte, challengeSize)
+	if _, err = rand.Read(challengePlain); err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to generate challenge: %w", err)
+	}
+
+	// Encrypt challenge using client nonce prefix + 8 zero bytes
+	nonce := buildNonce(keys.ClientNoncePrefix)
+	encryptedChallenge := gcm.Seal(nil, nonce, challengePlain, nil)
+
+	// Build payload: salt || encryptedChallenge
+	payload = make([]byte, 0, SaltSize+len(encryptedChallenge))
+	payload = append(payload, salt...)
+	payload = append(payload, encryptedChallenge...)
+
+	return payload, challengePlain, keys, nil
+}
+
+// ServerHandshakePayload processes the client's handshake payload and
+// produces a response for HTTP-based tunneling. It decrypts the client's
+// challenge to verify the shared secret, then re-encrypts it with the
+// server nonce to prove the server also knows the secret.
+//
+// Returns:
+//   - response: the re-encrypted challenge (including GCM auth tag)
+//   - keys: the derived keys for subsequent operations
+func ServerHandshakePayload(payload []byte, secretBase64 string) (response []byte, keys *DerivedKeys, err error) {
+	// Validate minimum payload size: salt + at least 1 byte of ciphertext + GCM tag
+	if len(payload) <= SaltSize {
+		return nil, nil, errors.New("handshake payload too short")
+	}
+
+	// Split payload into salt and encrypted challenge
+	salt := payload[:SaltSize]
+	encryptedChallenge := payload[SaltSize:]
+
+	// Derive keys from shared secret and salt
+	keys, err = DeriveKeys(secretBase64, salt)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to derive keys: %w", err)
+	}
+
+	// Create AES-256-GCM cipher
+	gcm, err := newGCM(keys.EncryptionKey)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Decrypt challenge using client nonce
+	clientNonce := buildNonce(keys.ClientNoncePrefix)
+	challengePlain, err := gcm.Open(nil, clientNonce, encryptedChallenge, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to decrypt challenge: %w", err)
+	}
+
+	// Re-encrypt challenge using server nonce to prove knowledge of secret
+	serverNonce := buildNonce(keys.ServerNoncePrefix)
+	response = gcm.Seal(nil, serverNonce, challengePlain, nil)
+
+	return response, keys, nil
+}
+
+// ClientVerifyHandshake verifies the server's handshake response for
+// HTTP-based tunneling. It decrypts the server's response and compares
+// it with the original challenge using constant-time comparison.
+func ClientVerifyHandshake(response []byte, challengePlain []byte, keys *DerivedKeys) error {
+	// Create AES-256-GCM cipher
+	gcm, err := newGCM(keys.EncryptionKey)
+	if err != nil {
+		return err
+	}
+
+	// Decrypt response using server nonce
+	serverNonce := buildNonce(keys.ServerNoncePrefix)
+	decrypted, err := gcm.Open(nil, serverNonce, response, nil)
+	if err != nil {
+		return fmt.Errorf("failed to decrypt handshake response: %w", err)
+	}
+
+	// Constant-time comparison
+	if subtle.ConstantTimeCompare(decrypted, challengePlain) != 1 {
+		return errors.New("handshake verification failed: challenge mismatch")
+	}
+
+	return nil
 }

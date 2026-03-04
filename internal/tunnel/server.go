@@ -21,59 +21,188 @@
 package tunnel
 
 import (
+	"crypto/rand"
 	"encoding/binary"
-	"fmt"
+	"encoding/hex"
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/hashicorp/yamux"
 	"github.com/mkloubert/go-proxy/internal/crypto"
 	"github.com/mkloubert/go-proxy/internal/security"
+	"github.com/mkloubert/go-proxy/internal/stego"
 )
 
 const (
-	handshakeTimeout        = 10 * time.Second
 	streamHeaderTimeout     = 10 * time.Second
 	relayIdleTimeout        = 5 * time.Minute
 	yamuxAcceptBacklog      = 128
 	yamuxStreamCloseTimeout = 60 * time.Second
 	yamuxStreamOpenTimeout  = 30 * time.Second
 	yamuxMaxStreamWindow    = 512 * 1024 // 512KB per stream
+
+	maxRequestBodySize  = 2 * 1024 * 1024 // 2MB
+	sessionIdleTimeout  = 5 * time.Minute
+	sessionCleanupEvery = 30 * time.Second
+	downstreamDrainWait = 200 * time.Millisecond
+	maxDrainSize        = 512 * 1024 // 512KB
+	upstreamSendTimeout = 5 * time.Second
 )
 
-// Server is the remote side of the tunnel. It accepts incoming connections,
-// performs an encrypted handshake, and multiplexes streams via yamux.
-// Each stream carries a target address header followed by raw TCP data
-// that is relayed to the destination.
-type Server struct {
-	secret      string
-	connLimiter *security.ConnLimiter
-	rateLimiter *security.RateLimiter
-	ipFilter    *security.IPFilter
+// dummyAddr implements net.Addr for pipeConn.
+type dummyAddr struct{}
 
-	// allowPrivateIPs disables SSRF protection. Only set in tests via SetAllowPrivateIPs.
+func (dummyAddr) Network() string { return "pipe" }
+func (dummyAddr) String() string  { return "pipe" }
+
+// pipeConn implements net.Conn over channels, bridging HTTP handlers
+// and yamux/EncryptedConn. The HTTP handler writes incoming data to
+// upstream and reads outgoing data from downstream.
+type pipeConn struct {
+	upstream   chan []byte // HTTP handler writes here, Read() pulls from here
+	readBuf    []byte     // leftover from partial reads
+	readMu     sync.Mutex
+	downstream chan []byte // Write() pushes here, HTTP handler drains this
+	closeCh    chan struct{}
+	closeOnce  sync.Once
+}
+
+// newPipeConn creates a pipeConn with buffered channels.
+func newPipeConn() *pipeConn {
+	return &pipeConn{
+		upstream:   make(chan []byte, 64),
+		downstream: make(chan []byte, 64),
+		closeCh:    make(chan struct{}),
+	}
+}
+
+// Read blocks on the upstream channel and returns data to the caller
+// (yamux/EncryptedConn). Leftover data from a previous read is returned
+// first.
+func (p *pipeConn) Read(buf []byte) (int, error) {
+	p.readMu.Lock()
+	defer p.readMu.Unlock()
+
+	if len(p.readBuf) > 0 {
+		n := copy(buf, p.readBuf)
+		p.readBuf = p.readBuf[n:]
+		return n, nil
+	}
+
+	select {
+	case data, ok := <-p.upstream:
+		if !ok || len(data) == 0 {
+			return 0, io.EOF
+		}
+		n := copy(buf, data)
+		if n < len(data) {
+			p.readBuf = make([]byte, len(data)-n)
+			copy(p.readBuf, data[n:])
+		}
+		return n, nil
+	case <-p.closeCh:
+		return 0, io.EOF
+	}
+}
+
+// Write sends data to the downstream channel for the HTTP handler to
+// pick up. A copy of the data is made to prevent aliasing.
+func (p *pipeConn) Write(data []byte) (int, error) {
+	cp := make([]byte, len(data))
+	copy(cp, data)
+	select {
+	case p.downstream <- cp:
+		return len(data), nil
+	case <-p.closeCh:
+		return 0, io.ErrClosedPipe
+	}
+}
+
+// Close closes the pipeConn exactly once.
+func (p *pipeConn) Close() error {
+	p.closeOnce.Do(func() { close(p.closeCh) })
+	return nil
+}
+
+// LocalAddr returns a dummy address (pipe).
+func (p *pipeConn) LocalAddr() net.Addr { return dummyAddr{} }
+
+// RemoteAddr returns a dummy address (pipe).
+func (p *pipeConn) RemoteAddr() net.Addr { return dummyAddr{} }
+
+// SetDeadline is a no-op for HTTP-backed connections.
+func (p *pipeConn) SetDeadline(t time.Time) error { return nil }
+
+// SetReadDeadline is a no-op for HTTP-backed connections.
+func (p *pipeConn) SetReadDeadline(t time.Time) error { return nil }
+
+// SetWriteDeadline is a no-op for HTTP-backed connections.
+func (p *pipeConn) SetWriteDeadline(t time.Time) error { return nil }
+
+// Verify pipeConn implements net.Conn at compile time.
+var _ net.Conn = (*pipeConn)(nil)
+
+// tunnelSession holds state for one active tunnel connection.
+type tunnelSession struct {
+	keys     *crypto.DerivedKeys
+	pipe     *pipeConn
+	yamuxSes *yamux.Session
+	lastSeen time.Time
+	mu       sync.Mutex
+}
+
+// Server is the remote side of the tunnel. It serves an HTTP gallery API
+// where data is hidden inside PNG images via LSB steganography.
+// Handshakes create new sessions; subsequent requests exchange data
+// through the session's pipeConn, which feeds yamux/EncryptedConn.
+type Server struct {
+	secret          string
+	rateLimiter     *security.RateLimiter
+	ipFilter        *security.IPFilter
 	allowPrivateIPs bool
+
+	sessionMu sync.RWMutex
+	sessions  map[string]*tunnelSession
+
+	stopCh   chan struct{}
+	stopOnce sync.Once
+
+	cleanupOnce sync.Once
 }
 
 // NewServer creates a new tunnel Server with the given base64-encoded secret.
 func NewServer(secret string) *Server {
 	return &Server{
 		secret:      secret,
-		connLimiter: security.NewConnLimiter(256),
 		rateLimiter: security.NewRateLimiter(10, 5, 5, 5*time.Minute),
+		sessions:    make(map[string]*tunnelSession),
+		stopCh:      make(chan struct{}),
 	}
 }
 
-// Close stops background goroutines.
+// Close stops background goroutines, the rate limiter, and all active sessions.
 func (s *Server) Close() {
+	s.stopOnce.Do(func() {
+		close(s.stopCh)
+	})
 	s.rateLimiter.Stop()
+
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+	for token, sess := range s.sessions {
+		sess.yamuxSes.Close()
+		sess.pipe.Close()
+		delete(s.sessions, token)
+	}
 }
 
 // SetIPFilter assigns an IPFilter to the server. When set, incoming
-// connections from blocked IPs are rejected before any further processing.
+// requests from blocked IPs are rejected before any further processing.
 func (s *Server) SetIPFilter(f *security.IPFilter) {
 	s.ipFilter = f
 }
@@ -83,68 +212,83 @@ func (s *Server) SetAllowPrivateIPs(allow bool) {
 	s.allowPrivateIPs = allow
 }
 
-// Serve accepts connections on the given listener and handles each one
-// in a separate goroutine. It blocks until the listener is closed.
-func (s *Server) Serve(ln net.Listener) error {
-	slog.Info("tunnel server listening", "addr", ln.Addr().String())
-
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			return fmt.Errorf("accept failed: %w", err)
-		}
-
-		ip, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
-
-		// IP filter check — known-malicious or geo-blocked IPs are rejected immediately
-		if s.ipFilter != nil && s.ipFilter.IsBlocked(ip) {
-			slog.Debug("connection blocked by IP filter", "ip", ip)
-			conn.Close()
-			continue
-		}
-
-		// Rate limit check — blocked IPs are rejected without a goroutine
-		if !s.rateLimiter.Allow(ip) {
-			conn.Close()
-			continue
-		}
-
-		// Connection limit check
-		if !s.connLimiter.Acquire() {
-			conn.Close()
-			continue
-		}
-
-		go s.handleConn(conn, ip)
-	}
+// Handler returns an http.Handler that serves the gallery API.
+// Requests must be POST /api/v1/galleries/{uuid}/pictures with a PNG
+// body containing steganographically hidden data.
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/galleries/{uuid}/pictures", s.handlePicture)
+	return mux
 }
 
-// handleConn performs the encrypted handshake, creates a yamux session,
-// and dispatches each multiplexed stream.
-func (s *Server) handleConn(conn net.Conn, ip string) {
-	defer conn.Close()
-	defer s.connLimiter.Release()
+// handlePicture is the main request handler. It extracts hidden data
+// from the PNG body and routes to either handshake or data exchange
+// based on the presence of an Authorization header.
+func (s *Server) handlePicture(w http.ResponseWriter, r *http.Request) {
+	// 1. Get client IP from r.RemoteAddr
+	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
 
-	// Enforce handshake deadline so unauthenticated connections
-	// (bots, scanners) cannot hold goroutines open indefinitely.
-	conn.SetDeadline(time.Now().Add(handshakeTimeout))
-
-	// The server never sends data before the client proves knowledge of
-	// the shared secret. On failure, the connection is closed immediately
-	// with zero bytes sent — the port appears dead to the remote party.
-	encConn, err := crypto.ServerHandshake(conn, s.secret)
-	if err != nil {
-		s.rateLimiter.RecordFailure(ip)
-		slog.Debug("handshake failed", "remote", conn.RemoteAddr().String())
+	// 2. IP filter check
+	if s.ipFilter != nil && s.ipFilter.IsBlocked(ip) {
+		http.Error(w, "Not Found", http.StatusNotFound)
 		return
 	}
 
-	// Clear deadline after successful handshake
-	conn.SetDeadline(time.Time{})
+	// 3. Rate limiter check
+	if !s.rateLimiter.Allow(ip) {
+		http.Error(w, "Not Found", http.StatusNotFound)
+		return
+	}
 
-	slog.Info("handshake completed", "remote", conn.RemoteAddr().String())
+	// 4. Read request body (limit to 2MB)
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBodySize))
+	if err != nil {
+		http.Error(w, "Not Found", http.StatusNotFound)
+		return
+	}
 
-	// Create yamux session with hardened config
+	// 5. Extract hidden data from PNG
+	data, err := stego.Extract(body)
+	if err != nil {
+		http.Error(w, "Not Found", http.StatusNotFound)
+		return
+	}
+
+	// 6. Check Authorization header
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		// Handshake flow
+		s.handleHandshake(w, data, ip)
+	} else {
+		// Data exchange flow
+		token := strings.TrimPrefix(authHeader, "Bearer ")
+		s.handleDataExchange(w, data, token)
+	}
+}
+
+// handleHandshake processes a handshake request: verifies the shared secret,
+// creates a new tunnel session with pipeConn + EncryptedConn + yamux, and
+// returns the handshake response embedded in a PNG.
+func (s *Server) handleHandshake(w http.ResponseWriter, payload []byte, ip string) {
+	// 1. Process handshake
+	response, keys, err := crypto.ServerHandshakePayload(payload, s.secret)
+	if err != nil {
+		s.rateLimiter.RecordFailure(ip)
+		http.Error(w, "Not Found", http.StatusNotFound)
+		return
+	}
+
+	// 2. Create pipeConn
+	pipe := newPipeConn()
+
+	// 3. Wrap with EncryptedConn (server uses ServerNoncePrefix for writes)
+	encConn, err := crypto.NewEncryptedConn(pipe, keys.EncryptionKey, keys.ServerNoncePrefix)
+	if err != nil {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	// 4. Create yamux server session
 	yamuxCfg := yamux.DefaultConfig()
 	yamuxCfg.AcceptBacklog = yamuxAcceptBacklog
 	yamuxCfg.StreamCloseTimeout = yamuxStreamCloseTimeout
@@ -152,24 +296,148 @@ func (s *Server) handleConn(conn net.Conn, ip string) {
 	yamuxCfg.MaxStreamWindowSize = yamuxMaxStreamWindow
 	yamuxCfg.LogOutput = io.Discard
 
-	session, err := yamux.Server(encConn, yamuxCfg)
+	yamuxSes, err := yamux.Server(encConn, yamuxCfg)
 	if err != nil {
-		slog.Error("yamux session creation failed", "remote", conn.RemoteAddr().String(), "error", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
-	defer session.Close()
 
-	// Accept streams
+	// 5. Generate session token
+	token := generateToken()
+
+	// 6. Store session
+	sess := &tunnelSession{
+		keys:     keys,
+		pipe:     pipe,
+		yamuxSes: yamuxSes,
+		lastSeen: time.Now(),
+	}
+	s.sessionMu.Lock()
+	s.sessions[token] = sess
+	s.sessionMu.Unlock()
+
+	// 7. Start yamux stream accept goroutine
+	go s.acceptStreams(sess, token)
+
+	// 8. Start session cleanup goroutine (only once)
+	s.cleanupOnce.Do(func() {
+		go s.sessionCleanupLoop()
+	})
+
+	// 9. Embed response in PNG
+	w2, h2 := stego.RequiredImageSize(len(response))
+	carrier := stego.GenerateCarrier(w2, h2)
+	pngBytes, err := stego.Embed(carrier, response)
+	if err != nil {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	// 10. Send response
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Authorization", "Bearer "+token)
+	w.WriteHeader(http.StatusCreated)
+	w.Write(pngBytes)
+
+	slog.Info("handshake completed, session created", "token_prefix", token[:8])
+}
+
+// handleDataExchange processes a data exchange request: pushes upstream
+// data into the session's pipeConn and drains downstream data back as
+// a steganographic PNG response.
+func (s *Server) handleDataExchange(w http.ResponseWriter, upstreamData []byte, token string) {
+	// 1. Get session
+	s.sessionMu.RLock()
+	sess := s.sessions[token]
+	s.sessionMu.RUnlock()
+
+	if sess == nil {
+		http.Error(w, "Not Found", http.StatusNotFound)
+		return
+	}
+
+	// 2. Touch session
+	sess.mu.Lock()
+	sess.lastSeen = time.Now()
+	sess.mu.Unlock()
+
+	// 3. Push upstream data to pipeConn (non-blocking with timeout)
+	if len(upstreamData) > 0 {
+		select {
+		case sess.pipe.upstream <- upstreamData:
+		case <-time.After(upstreamSendTimeout):
+			slog.Debug("upstream channel full, dropping data")
+		}
+	}
+
+	// 4. Wait briefly for downstream data, then drain
+	downstreamData := s.drainDownstream(sess.pipe, downstreamDrainWait)
+
+	// 5. Embed in response PNG (even if empty)
+	w2, h2 := stego.RequiredImageSize(len(downstreamData))
+	carrier := stego.GenerateCarrier(w2, h2)
+	pngBytes, err := stego.Embed(carrier, downstreamData)
+	if err != nil {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	// 6. Send response
+	w.Header().Set("Content-Type", "image/png")
+	w.WriteHeader(http.StatusCreated)
+	w.Write(pngBytes)
+}
+
+// drainDownstream waits up to timeout for the first chunk of downstream
+// data, then drains any additional immediately available chunks up to
+// maxDrainSize bytes.
+func (s *Server) drainDownstream(pipe *pipeConn, timeout time.Duration) []byte {
+	var buf []byte
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	// Wait for first chunk or timeout
+	select {
+	case data := <-pipe.downstream:
+		buf = append(buf, data...)
+	case <-timer.C:
+		return buf
+	case <-pipe.closeCh:
+		return buf
+	}
+
+	// Drain any additional immediately available chunks
+	for len(buf) < maxDrainSize {
+		select {
+		case data := <-pipe.downstream:
+			buf = append(buf, data...)
+		default:
+			return buf
+		}
+	}
+	return buf
+}
+
+// acceptStreams accepts yamux streams and dispatches each one to
+// handleStream. When the yamux session ends, the tunnel session is
+// cleaned up.
+func (s *Server) acceptStreams(sess *tunnelSession, token string) {
+	defer func() {
+		sess.yamuxSes.Close()
+		sess.pipe.Close()
+		s.sessionMu.Lock()
+		delete(s.sessions, token)
+		s.sessionMu.Unlock()
+	}()
+
 	for {
-		stream, err := session.Accept()
+		stream, err := sess.yamuxSes.Accept()
 		if err != nil {
 			if err != io.EOF {
-				slog.Error("stream accept failed", "remote", conn.RemoteAddr().String(), "error", err)
+				slog.Debug("stream accept ended", "error", err)
 			}
 			return
 		}
-
-		slog.Debug("new stream accepted", "remote", conn.RemoteAddr().String())
 		go s.handleStream(stream)
 	}
 }
@@ -274,4 +542,46 @@ func relay(a, b net.Conn) {
 	// Wait for both goroutines to finish
 	<-done
 	<-done
+}
+
+// generateToken generates a cryptographically random session token
+// (32 random bytes, hex-encoded to 64 characters).
+func generateToken() string {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		panic("tunnel: failed to generate token: " + err.Error())
+	}
+	return hex.EncodeToString(b)
+}
+
+// sessionCleanupLoop periodically removes idle sessions.
+func (s *Server) sessionCleanupLoop() {
+	ticker := time.NewTicker(sessionCleanupEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			s.cleanupSessions(sessionIdleTimeout)
+		case <-s.stopCh:
+			return
+		}
+	}
+}
+
+// cleanupSessions removes sessions that have been idle for longer than
+// maxIdle.
+func (s *Server) cleanupSessions(maxIdle time.Duration) {
+	now := time.Now()
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+	for token, sess := range s.sessions {
+		sess.mu.Lock()
+		idle := now.Sub(sess.lastSeen)
+		sess.mu.Unlock()
+		if idle > maxIdle {
+			sess.yamuxSes.Close()
+			sess.pipe.Close()
+			delete(s.sessions, token)
+		}
+	}
 }

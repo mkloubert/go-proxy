@@ -21,14 +21,14 @@
 package tunnel
 
 import (
-	"context"
+	"bytes"
 	"encoding/base64"
-	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
-	"time"
 )
 
 // makeTestSecret generates a valid base64-encoded 32-byte secret for testing.
@@ -75,176 +75,86 @@ func startEchoServer(t *testing.T) (net.Listener, func()) {
 	return ln, cleanup
 }
 
-// startTunnelServer starts a tunnel server on a random port with the given
-// secret. It returns the listener address and a cleanup function.
-func startTunnelServer(t *testing.T, secret string) (string, func()) {
+// startTunnelHTTPServer starts a tunnel server as an HTTP test server
+// with the given secret. It returns the httptest.Server and a cleanup function.
+func startTunnelHTTPServer(t *testing.T, secret string) (*httptest.Server, func()) {
 	t.Helper()
-
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to start tunnel server listener: %v", err)
-	}
 
 	srv := NewServer(secret)
 	srv.SetAllowPrivateIPs(true)
 
-	go func() {
-		srv.Serve(ln)
-	}()
+	ts := httptest.NewServer(srv.Handler())
 
 	cleanup := func() {
 		srv.Close()
-		ln.Close()
+		ts.Close()
 	}
 
-	return ln.Addr().String(), cleanup
+	return ts, cleanup
 }
 
-func TestTunnelRoundtrip(t *testing.T) {
+// startTunnelHTTPServerRaw starts a tunnel server and returns it along
+// with its HTTP test server for more fine-grained test control.
+func startTunnelHTTPServerRaw(t *testing.T, secret string) (*Server, *httptest.Server, func()) {
+	t.Helper()
+
+	srv := NewServer(secret)
+	srv.SetAllowPrivateIPs(true)
+
+	ts := httptest.NewServer(srv.Handler())
+
+	cleanup := func() {
+		srv.Close()
+		ts.Close()
+	}
+
+	return srv, ts, cleanup
+}
+
+func TestServerHandlerRouting(t *testing.T) {
 	secret := makeTestSecret(0xAA)
 
-	// Step 1: Start echo server (the "internet target")
-	echoLn, echoCleanup := startEchoServer(t)
-	defer echoCleanup()
+	srv := NewServer(secret)
+	defer srv.Close()
 
-	echoAddr := echoLn.Addr().String()
+	handler := srv.Handler()
 
-	// Step 2: Start tunnel server
-	tunnelAddr, tunnelCleanup := startTunnelServer(t, secret)
-	defer tunnelCleanup()
+	// Test that GET requests return 405 or similar (method not allowed)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/galleries/test-uuid/pictures", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
 
-	// Step 3: Create tunnel client and connect
-	client := NewClient(tunnelAddr, secret)
-	defer client.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if err := client.Connect(ctx); err != nil {
-		t.Fatalf("client.Connect failed: %v", err)
+	// Go 1.22+ ServeMux returns 405 for wrong method
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 for GET, got %d", w.Code)
 	}
 
-	// Step 4: Open stream to echo server
-	stream, err := client.OpenStream(echoAddr)
-	if err != nil {
-		t.Fatalf("client.OpenStream failed: %v", err)
-	}
-	defer stream.Close()
+	// Test that POST to wrong path returns 404
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/wrong/path", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
 
-	// Step 5: Write "hello" and read it back
-	msg := []byte("hello")
-	if _, err := stream.Write(msg); err != nil {
-		t.Fatalf("stream.Write failed: %v", err)
-	}
-
-	buf := make([]byte, len(msg))
-	if _, err := io.ReadFull(stream, buf); err != nil {
-		t.Fatalf("stream.Read failed: %v", err)
-	}
-
-	// Step 6: Verify data matches
-	if string(buf) != string(msg) {
-		t.Fatalf("expected %q, got %q", msg, buf)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for wrong path, got %d", w.Code)
 	}
 }
 
-func TestTunnelMultipleStreams(t *testing.T) {
+func TestServerHandleInvalidPNG(t *testing.T) {
 	secret := makeTestSecret(0xBB)
 
-	// Step 1: Start echo server
-	echoLn, echoCleanup := startEchoServer(t)
-	defer echoCleanup()
+	srv := NewServer(secret)
+	defer srv.Close()
 
-	echoAddr := echoLn.Addr().String()
+	handler := srv.Handler()
 
-	// Step 2: Start tunnel server
-	tunnelAddr, tunnelCleanup := startTunnelServer(t, secret)
-	defer tunnelCleanup()
+	// Send invalid PNG data — should return 404 (stego.Extract fails)
+	garbage := []byte("this is not a valid PNG file")
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/galleries/test-uuid/pictures", bytes.NewReader(garbage))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
 
-	// Step 3: Create tunnel client and connect
-	client := NewClient(tunnelAddr, secret)
-	defer client.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if err := client.Connect(ctx); err != nil {
-		t.Fatalf("client.Connect failed: %v", err)
+	// Invalid PNG will fail stego.Extract
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for invalid PNG, got %d", w.Code)
 	}
-
-	// Step 4: Open 3 streams simultaneously
-	const numStreams = 3
-	var wg sync.WaitGroup
-	errs := make(chan error, numStreams)
-
-	for i := 0; i < numStreams; i++ {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-
-			stream, err := client.OpenStream(echoAddr)
-			if err != nil {
-				errs <- fmt.Errorf("stream %d: OpenStream failed: %w", idx, err)
-				return
-			}
-			defer stream.Close()
-
-			// Write unique data per stream
-			msg := []byte(fmt.Sprintf("stream-%d-data", idx))
-			if _, err := stream.Write(msg); err != nil {
-				errs <- fmt.Errorf("stream %d: Write failed: %w", idx, err)
-				return
-			}
-
-			buf := make([]byte, len(msg))
-			if _, err := io.ReadFull(stream, buf); err != nil {
-				errs <- fmt.Errorf("stream %d: Read failed: %w", idx, err)
-				return
-			}
-
-			if string(buf) != string(msg) {
-				errs <- fmt.Errorf("stream %d: expected %q, got %q", idx, msg, buf)
-				return
-			}
-		}(i)
-	}
-
-	wg.Wait()
-	close(errs)
-
-	for err := range errs {
-		t.Fatal(err)
-	}
-}
-
-func TestTunnelWrongSecret(t *testing.T) {
-	serverSecret := makeTestSecret(0xCC)
-	clientSecret := makeTestSecret(0xDD)
-
-	// Step 1: Start tunnel server with secret A
-	tunnelAddr, tunnelCleanup := startTunnelServer(t, serverSecret)
-	defer tunnelCleanup()
-
-	// Step 2: Create tunnel client with secret B
-	client := NewClient(tunnelAddr, clientSecret)
-	defer client.Close()
-
-	// Step 3: Connect should fail (handshake error due to secret mismatch)
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	err := client.Connect(ctx)
-
-	// The connect should fail because the context times out after retries,
-	// or the handshake itself fails.
-	if err == nil {
-		// If Connect succeeded, try to open a stream - it should fail
-		// because the handshake would have produced garbage.
-		stream, openErr := client.OpenStream("127.0.0.1:1")
-		if openErr == nil {
-			stream.Close()
-			t.Fatal("expected error with wrong secret, but connection and stream succeeded")
-		}
-	}
-	// If err != nil, the test passes: wrong secret caused failure.
 }

@@ -1,27 +1,39 @@
 # go-proxy
 
-A CLI tool that provides a local HTTP/HTTPS/SOCKS5 proxy with an encrypted tunnel to a remote server. It prevents man-in-the-middle attacks in untrusted networks.
+A CLI tool that provides a local HTTP/HTTPS/SOCKS5 proxy with an encrypted tunnel to a remote server. It prevents man-in-the-middle attacks in untrusted networks by disguising tunnel traffic as a normal image gallery API.
 
 ## How It Works
 
 `go-proxy` has two modes:
 
-- **Remote mode**: Runs on a trusted server with direct internet access. It listens for encrypted tunnel connections and forwards traffic to the internet.
-- **Local mode**: Runs on your machine in the untrusted network. It accepts proxy connections (HTTP, HTTPS, SOCKS5) and sends all traffic through an encrypted tunnel to the remote server.
+- **Remote mode**: Runs on a trusted server with direct internet access. It serves an HTTP gallery API that secretly carries encrypted tunnel data inside PNG images.
+- **Local mode**: Runs on your machine in the untrusted network. It accepts proxy connections (HTTP, HTTPS, SOCKS5) and sends all traffic through the steganographic tunnel to the remote server.
 
-All traffic between local and remote is encrypted with AES-256-GCM. The encryption key is shared via an environment variable.
+All data between local and remote is encrypted with AES-256-GCM and hidden inside valid PNG images using LSB steganography. The tunnel looks like normal HTTP traffic to an image gallery API, making it compatible with restrictive corporate proxies that perform TLS interception.
 
 ```
 Your Machine (untrusted network)        Trusted Server
 +---------------------------+           +---------------------------+
 | Browser / App             |           |                           |
 |       |                   |           |                           |
-| [go-proxy local]          |  AES-256  | [go-proxy remote]         |
-| HTTP/HTTPS/SOCKS5 proxy   |<--------->| Tunnel server             |
-| 127.0.0.1:12345           |  encrypted|       |                   |
-+---------------------------+   tunnel  |   Internet                |
-                                        +---------------------------+
+| [go-proxy local]          |  HTTP/1.1 | [go-proxy remote]         |
+| HTTP/HTTPS/SOCKS5 proxy   |<--------->| Gallery API server        |
+| 127.0.0.1:12345           |  PNG with |       |                   |
++---------------------------+  hidden   |   Internet                |
+                               data     +---------------------------+
 ```
+
+## How the Tunnel Works
+
+The tunnel disguises itself as a REST API for an image gallery:
+
+1. Every request is a `POST /api/v1/galleries/{uuid}/pictures` with a PNG image body.
+2. Upstream data (from your apps) is encrypted with AES-256-GCM and hidden inside the PNG using 2-bit LSB steganography on the R, G, B channels.
+3. The server extracts the hidden data, processes it, and responds with another PNG containing the downstream data.
+4. A random UUID is used for each request, making every URL unique.
+5. Only standard HTTP headers are used: `Content-Type: image/png` and `Authorization: Bearer <token>`.
+
+This makes the traffic look like a normal image upload API to any proxy, firewall, or TLS inspection device.
 
 ## Build
 
@@ -52,7 +64,7 @@ On the trusted server (with direct internet access):
 
 ```bash
 export GOPROXY_TUNNEL_SECRET="your-base64-encoded-secret-here"
-./go-proxy remote --port=9876
+./go-proxy remote --port=80
 ```
 
 ### 3. Start the Local Proxy
@@ -61,7 +73,7 @@ On your local machine (in the untrusted network):
 
 ```bash
 export GOPROXY_TUNNEL_SECRET="your-base64-encoded-secret-here"
-./go-proxy local --port=12345 --connect-to="your-server.com:9876"
+./go-proxy local --port=12345 --connect-to="http://your-server.com:80"
 ```
 
 ### 4. Configure Your Applications
@@ -94,11 +106,11 @@ export HTTPS_PROXY=http://127.0.0.1:12345
 
 Start the local proxy.
 
-| Flag           | Short | Default    | Description                       |
-| -------------- | ----- | ---------- | --------------------------------- |
-| `--port`       | `-p`  | 8080       | Port for the local proxy          |
-| `--connect-to` | `-c`  | (required) | Remote server address (host:port) |
-| `--verbose`    | `-v`  | false      | Enable debug logging              |
+| Flag           | Short | Default    | Description                                    |
+| -------------- | ----- | ---------- | ---------------------------------------------- |
+| `--port`       | `-p`  | 8080       | Port for the local proxy                       |
+| `--connect-to` | `-c`  | (required) | Remote server URL (e.g., `http://host.com:80`) |
+| `--verbose`    | `-v`  | false      | Enable debug logging                           |
 
 ### `go-proxy remote`
 
@@ -135,19 +147,22 @@ Place a `GeoLite2.mmdb` file (from [MaxMind](https://dev.maxmind.com/geoip/geoli
 
 ```bash
 export GOPROXY_BLOCKED_COUNTRIES="CN,RU,IR"
-./go-proxy remote --port=9876
+./go-proxy remote --port=80
 ```
 
 Country codes are [ISO 3166-1 alpha-2](https://en.wikipedia.org/wiki/ISO_3166-1_alpha-2), case-insensitive, and whitespace is trimmed.
 
 ## Security
 
-- Both local and remote listen on `0.0.0.0` (all interfaces) by default.
-- All traffic between local and remote is encrypted with AES-256-GCM.
-- Keys are derived using HKDF (SHA-256) with a random salt per connection.
+- All tunnel traffic is hidden inside valid PNG images using LSB steganography.
+- The tunnel looks like a normal image gallery REST API to network observers.
+- All data is encrypted with AES-256-GCM before being embedded in images.
+- Keys are derived using HKDF (SHA-256) with a random salt per session.
 - A challenge/response handshake verifies both sides share the same secret.
 - The encryption key is never logged.
+- Only standard HTTP headers are used (`Content-Type`, `Authorization`).
 - IP blocking via threat intelligence feeds and GeoIP country filtering (remote server).
+- SSRF protection prevents the remote server from connecting to private/internal IPs.
 
 ## License
 

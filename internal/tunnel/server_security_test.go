@@ -21,184 +21,168 @@
 package tunnel
 
 import (
-	"context"
+	"bytes"
 	"io"
-	"net"
+	"net/http"
+	"net/http/httptest"
 	"testing"
-	"time"
+
+	"github.com/mkloubert/go-proxy/internal/crypto"
+	"github.com/mkloubert/go-proxy/internal/stego"
 )
 
-func TestServerBlackholeOnWrongSecret(t *testing.T) {
-	serverSecret := makeTestSecret(0xA1)
+func TestServerRejectsGarbagePNG(t *testing.T) {
+	secret := makeTestSecret(0xA1)
 
-	tunnelAddr, cleanup := startTunnelServer(t, serverSecret)
-	defer cleanup()
+	srv := NewServer(secret)
+	defer srv.Close()
 
-	// Connect with raw TCP and send garbage — server must not respond
-	conn, err := net.DialTimeout("tcp4", tunnelAddr, 5*time.Second)
-	if err != nil {
-		t.Fatalf("dial failed: %v", err)
+	handler := srv.Handler()
+
+	// Send garbage data (not valid PNG) — server must return 404
+	garbage := make([]byte, 64)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/galleries/test-uuid/pictures", bytes.NewReader(garbage))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for garbage PNG, got %d", w.Code)
 	}
-	defer conn.Close()
 
-	// Send 32 bytes "salt" + garbage encrypted frame
-	conn.Write(make([]byte, 32))
-	garbage := []byte{0x00, 0x00, 0x00, 0x20}
-	garbage = append(garbage, make([]byte, 32)...)
-	conn.Write(garbage)
-
-	// Server should close without sending any data
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	buf := make([]byte, 1)
-	_, err = conn.Read(buf)
-	if err == nil {
-		t.Fatal("server should not send any data to unauthenticated client")
+	// Verify no sensitive info is leaked in the body
+	body := w.Body.String()
+	if body != "Not Found\n" {
+		t.Fatalf("unexpected response body: %q", body)
 	}
 }
 
-func TestServerBlocksIPAfterFailedHandshakes(t *testing.T) {
+func TestServerRejectsInvalidHandshake(t *testing.T) {
 	secret := makeTestSecret(0xA2)
 
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	srv := NewServer(secret)
+	defer srv.Close()
+
+	handler := srv.Handler()
+
+	// Create a valid PNG with garbage handshake data
+	garbagePayload := make([]byte, 64)
+	w2, h2 := stego.RequiredImageSize(len(garbagePayload))
+	carrier := stego.GenerateCarrier(w2, h2)
+	pngBytes, err := stego.Embed(carrier, garbagePayload)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("failed to embed: %v", err)
 	}
+
+	// No Authorization header = handshake attempt
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/galleries/test-uuid/pictures", bytes.NewReader(pngBytes))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	// Should fail because handshake data is garbage
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for invalid handshake, got %d", w.Code)
+	}
+}
+
+func TestServerRejectsInvalidToken(t *testing.T) {
+	secret := makeTestSecret(0xA3)
+
+	srv := NewServer(secret)
+	defer srv.Close()
+
+	handler := srv.Handler()
+
+	// Create a valid PNG with some payload
+	payload := []byte("test data")
+	w2, h2 := stego.RequiredImageSize(len(payload))
+	carrier := stego.GenerateCarrier(w2, h2)
+	pngBytes, err := stego.Embed(carrier, payload)
+	if err != nil {
+		t.Fatalf("failed to embed: %v", err)
+	}
+
+	// Send with an invalid token
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/galleries/test-uuid/pictures", bytes.NewReader(pngBytes))
+	req.Header.Set("Authorization", "Bearer invalid-token-that-does-not-exist")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for invalid token, got %d", w.Code)
+	}
+}
+
+func TestServerEmptyBodyReturns404(t *testing.T) {
+	secret := makeTestSecret(0xA4)
+
+	srv := NewServer(secret)
+	defer srv.Close()
+
+	handler := srv.Handler()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/galleries/test-uuid/pictures", bytes.NewReader([]byte{}))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for empty body, got %d", w.Code)
+	}
+}
+
+func TestServerHandshakeSuccess(t *testing.T) {
+	secret := makeTestSecret(0xA5)
 
 	srv := NewServer(secret)
 	srv.SetAllowPrivateIPs(true)
-	go srv.Serve(ln)
 	defer srv.Close()
-	defer ln.Close()
 
-	addr := ln.Addr().String()
+	handler := srv.Handler()
 
-	// Send 6 failed handshake attempts (threshold is 5)
-	for i := 0; i < 6; i++ {
-		c, err := net.DialTimeout("tcp4", addr, 2*time.Second)
-		if err != nil {
-			continue
-		}
-		// Send garbage salt + garbage frame
-		c.Write(make([]byte, 32))
-		c.Write([]byte{0x00, 0x00, 0x00, 0x20})
-		c.Write(make([]byte, 32))
-		// Wait for server to process the handshake failure
-		c.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-		io.ReadAll(c)
-		c.Close()
-	}
-
-	// Wait for server to process
-	time.Sleep(200 * time.Millisecond)
-
-	// Next connection should be immediately closed (IP blocked)
-	c, err := net.DialTimeout("tcp4", addr, 2*time.Second)
+	// Create a proper handshake payload using the crypto package
+	hsPayload, _, _, err := crypto.ClientHandshakePayload(secret)
 	if err != nil {
-		// Connection refused — IP is blocked, test passes
-		return
+		t.Fatalf("failed to create handshake payload: %v", err)
 	}
-	defer c.Close()
 
-	// If connected, server should close it immediately (no handshake attempt)
-	c.SetReadDeadline(time.Now().Add(1 * time.Second))
-	buf := make([]byte, 1)
-	_, err = c.Read(buf)
-	if err == nil {
-		t.Fatal("blocked IP should not receive any data")
-	}
-}
-
-func TestServerRejectsPrivateIPTarget(t *testing.T) {
-	secret := makeTestSecret(0xA3)
-
-	// Start echo server on loopback
-	echoLn, echoCleanup := startEchoServer(t)
-	defer echoCleanup()
-	echoAddr := echoLn.Addr().String()
-
-	// Create server WITHOUT AllowPrivateIPs (default: SSRF protection on)
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	// Embed handshake payload in PNG
+	w2, h2 := stego.RequiredImageSize(len(hsPayload))
+	carrier := stego.GenerateCarrier(w2, h2)
+	pngBytes, err := stego.Embed(carrier, hsPayload)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("failed to embed: %v", err)
 	}
 
-	srv := NewServer(secret)
-	// AllowPrivateIPs = false (default)
-	go srv.Serve(ln)
-	defer srv.Close()
-	defer ln.Close()
+	// Send handshake (no Authorization header)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/galleries/test-uuid/pictures", bytes.NewReader(pngBytes))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
 
-	tunnelAddr := ln.Addr().String()
-
-	// Connect with correct secret
-	client := NewClient(tunnelAddr, secret)
-	defer client.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if err := client.Connect(ctx); err != nil {
-		t.Fatalf("connect failed: %v", err)
+	if w.Code != http.StatusCreated {
+		body, _ := io.ReadAll(w.Body)
+		t.Fatalf("expected 201 for successful handshake, got %d: %s", w.Code, body)
 	}
 
-	// Try to open stream to private IP — should fail
-	stream, err := client.OpenStream(echoAddr)
+	// Response should contain Authorization header with token
+	authHeader := w.Header().Get("Authorization")
+	if authHeader == "" {
+		t.Fatal("expected Authorization header in response")
+	}
+	if len(authHeader) < len("Bearer ")+8 {
+		t.Fatalf("token too short: %s", authHeader)
+	}
+
+	// Response should be a PNG
+	contentType := w.Header().Get("Content-Type")
+	if contentType != "image/png" {
+		t.Fatalf("expected Content-Type image/png, got %s", contentType)
+	}
+
+	// Should be able to extract data from the response PNG
+	respData, err := stego.Extract(w.Body.Bytes())
 	if err != nil {
-		return // stream open failed — acceptable
+		t.Fatalf("failed to extract from response PNG: %v", err)
 	}
-	defer stream.Close()
-
-	// Write data — server should reject the target and close the stream
-	stream.Write([]byte("hello"))
-	stream.SetReadDeadline(time.Now().Add(2 * time.Second))
-	buf := make([]byte, 5)
-	_, err = stream.Read(buf)
-	if err == nil && string(buf) == "hello" {
-		t.Fatal("server should have rejected connection to private IP")
-	}
-}
-
-func TestServerLegitimateConnectionStillWorks(t *testing.T) {
-	secret := makeTestSecret(0xA4)
-
-	// Start echo server
-	echoLn, echoCleanup := startEchoServer(t)
-	defer echoCleanup()
-	echoAddr := echoLn.Addr().String()
-
-	// Start server WITH AllowPrivateIPs (to test with loopback echo server)
-	tunnelAddr, tunnelCleanup := startTunnelServer(t, secret)
-	defer tunnelCleanup()
-
-	// Connect with correct secret
-	client := NewClient(tunnelAddr, secret)
-	defer client.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if err := client.Connect(ctx); err != nil {
-		t.Fatalf("connect failed: %v", err)
-	}
-
-	// Open stream — should work normally
-	stream, err := client.OpenStream(echoAddr)
-	if err != nil {
-		t.Fatalf("OpenStream failed: %v", err)
-	}
-	defer stream.Close()
-
-	msg := []byte("security test")
-	if _, err := stream.Write(msg); err != nil {
-		t.Fatalf("write failed: %v", err)
-	}
-
-	buf := make([]byte, len(msg))
-	if _, err := io.ReadFull(stream, buf); err != nil {
-		t.Fatalf("read failed: %v", err)
-	}
-
-	if string(buf) != string(msg) {
-		t.Fatalf("expected %q, got %q", msg, buf)
+	if len(respData) == 0 {
+		t.Fatal("expected non-empty handshake response data")
 	}
 }

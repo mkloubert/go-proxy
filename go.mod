@@ -3,6 +3,7 @@ module github.com/mkloubert/go-proxy
 go 1.25.1
 
 require (
+	github.com/google/uuid v1.6.0
 	github.com/hashicorp/yamux v0.1.2
 	github.com/oschwald/geoip2-golang v1.13.0
 	github.com/spf13/cobra v1.10.2
