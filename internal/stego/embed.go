@@ -25,8 +25,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"image"
-	"image/color"
 	"image/png"
+	"sync"
 )
 
 const (
@@ -39,6 +39,13 @@ const (
 	// minDimension is the minimum image dimension returned by RequiredImageSize.
 	minDimension = 16
 )
+
+// pngBufPool reuses buffers for PNG encoding to reduce GC pressure.
+var pngBufPool = sync.Pool{
+	New: func() any {
+		return bytes.NewBuffer(make([]byte, 0, 256*1024))
+	},
+}
 
 // RequiredImageSize returns the minimum square image dimensions (width, height)
 // needed to embed dataLen bytes of payload plus a 4-byte length header.
@@ -99,12 +106,16 @@ func Embed(carrier *image.RGBA, data []byte) ([]byte, error) {
 	clone := image.NewRGBA(bounds)
 	copy(clone.Pix, carrier.Pix)
 
+	// Direct pix-slice access for performance (avoids interface dispatch).
+	pix := clone.Pix
+	stride := clone.Stride
 	bitIdx := 0
-	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
-		for x := bounds.Min.X; x < bounds.Max.X; x++ {
-			r, g, b, a := clone.At(x, y).RGBA()
 
-			// Extract 6 bits (2 per channel) from the payload bit stream.
+	for y := 0; y < height; y++ {
+		rowOffset := y * stride
+		for x := 0; x < width; x++ {
+			offset := rowOffset + x*4
+
 			bit0 := getBit(bits, bitIdx)
 			bit1 := getBit(bits, bitIdx+1)
 			bit2 := getBit(bits, bitIdx+2)
@@ -113,28 +124,27 @@ func Embed(carrier *image.RGBA, data []byte) ([]byte, error) {
 			bit5 := getBit(bits, bitIdx+5)
 			bitIdx += bitsPerPixel
 
-			// Replace the 2 LSBs of each channel.
-			nr := (uint8(r>>8) & 0xFC) | (bit0 << 1) | bit1
-			ng := (uint8(g>>8) & 0xFC) | (bit2 << 1) | bit3
-			nb := (uint8(b>>8) & 0xFC) | (bit4 << 1) | bit5
-
-			clone.SetRGBA(x, y, color.RGBA{
-				R: nr,
-				G: ng,
-				B: nb,
-				A: uint8(a >> 8),
-			})
+			// Replace the 2 LSBs of each channel directly in the pix slice.
+			pix[offset] = (pix[offset] & 0xFC) | (bit0 << 1) | bit1
+			pix[offset+1] = (pix[offset+1] & 0xFC) | (bit2 << 1) | bit3
+			pix[offset+2] = (pix[offset+2] & 0xFC) | (bit4 << 1) | bit5
+			// pix[offset+3] (alpha) stays untouched
 		}
 	}
 
-	// Encode to PNG with fast compression.
-	var buf bytes.Buffer
+	// Encode to PNG with fast compression using pooled buffer.
+	buf := pngBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer pngBufPool.Put(buf)
+
 	encoder := png.Encoder{CompressionLevel: png.BestSpeed}
-	if err := encoder.Encode(&buf, clone); err != nil {
+	if err := encoder.Encode(buf, clone); err != nil {
 		return nil, errors.New("stego: failed to encode PNG: " + err.Error())
 	}
 
-	return buf.Bytes(), nil
+	result := make([]byte, buf.Len())
+	copy(result, buf.Bytes())
+	return result, nil
 }
 
 // Extract reads hidden data from PNG-encoded bytes that were produced by Embed.
@@ -150,24 +160,46 @@ func Extract(pngData []byte) ([]byte, error) {
 	width := bounds.Dx()
 	height := bounds.Dy()
 
-	// Collect all embedded bits.
+	// Collect all embedded bits using direct pix-slice access when possible.
 	totalBits := width * height * bitsPerPixel
 	allBits := make([]byte, 0, totalBits)
 
-	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
-		for x := bounds.Min.X; x < bounds.Max.X; x++ {
-			r, g, b, _ := img.At(x, y).RGBA()
+	if rgba, ok := img.(*image.RGBA); ok {
+		// Fast path: direct pixel array access.
+		pix := rgba.Pix
+		stride := rgba.Stride
 
-			rv := uint8(r >> 8)
-			gv := uint8(g >> 8)
-			bv := uint8(b >> 8)
+		for y := 0; y < height; y++ {
+			rowOffset := y * stride
+			for x := 0; x < width; x++ {
+				offset := rowOffset + x*4
+				r := pix[offset]
+				g := pix[offset+1]
+				b := pix[offset+2]
 
-			// Extract 2 LSBs from each channel (MSB first within the pair).
-			allBits = append(allBits,
-				(rv>>1)&1, rv&1,
-				(gv>>1)&1, gv&1,
-				(bv>>1)&1, bv&1,
-			)
+				allBits = append(allBits,
+					(r>>1)&1, r&1,
+					(g>>1)&1, g&1,
+					(b>>1)&1, b&1,
+				)
+			}
+		}
+	} else {
+		// Fallback: use image interface (for non-RGBA PNG inputs).
+		for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+			for x := bounds.Min.X; x < bounds.Max.X; x++ {
+				r, g, b, _ := img.At(x, y).RGBA()
+
+				rv := uint8(r >> 8)
+				gv := uint8(g >> 8)
+				bv := uint8(b >> 8)
+
+				allBits = append(allBits,
+					(rv>>1)&1, rv&1,
+					(gv>>1)&1, gv&1,
+					(bv>>1)&1, bv&1,
+				)
+			}
 		}
 	}
 

@@ -38,46 +38,60 @@ var supportedSizes = []int{16, 32, 64, 128, 256, 512, 1024}
 
 const imageCount = 9
 
+// carrierCache holds pre-decoded RGBA images keyed by dimension.
+// Populated once at init(), never modified afterward.
+var carrierCache map[int][]*image.RGBA
+
+func init() {
+	carrierCache = make(map[int][]*image.RGBA, len(supportedSizes))
+	for _, size := range supportedSizes {
+		variants := make([]*image.RGBA, imageCount)
+		for i := 0; i < imageCount; i++ {
+			path := fmt.Sprintf("images/image_%d_%dx%d.png", i+1, size, size)
+			data, err := embeddedImages.ReadFile(path)
+			if err != nil {
+				panic("stego: failed to read embedded image for cache: " + err.Error())
+			}
+
+			img, err := png.Decode(bytes.NewReader(data))
+			if err != nil {
+				panic("stego: failed to decode embedded image for cache: " + err.Error())
+			}
+
+			bounds := img.Bounds()
+			rgba := image.NewRGBA(bounds)
+			for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+				for x := bounds.Min.X; x < bounds.Max.X; x++ {
+					rgba.Set(x, y, img.At(x, y))
+				}
+			}
+			variants[i] = rgba
+		}
+		carrierCache[size] = variants
+	}
+}
+
 // GenerateCarrier returns an RGBA carrier image of the given dimensions by
-// loading a randomly chosen embedded photo and decoding it. The photos are
-// real images (9 variants at 7 resolutions each), so the resulting PNGs
-// look natural to DPI systems.
+// cloning a randomly chosen pre-cached photo. The photos are real images
+// (9 variants at 7 resolutions each), so the resulting PNGs look natural
+// to DPI systems.
 //
 // The requested (width, height) is matched to the nearest supported square
 // size (16, 32, 64, 128, 256, 512, 1024). A random image (1-9) is picked
 // using crypto/rand.
 func GenerateCarrier(width, height int) *image.RGBA {
-	// Pick the larger dimension and find the nearest supported size
 	dim := width
 	if height > dim {
 		dim = height
 	}
 	size := bestSize(dim)
 
-	// Pick a random image number [1, imageCount]
-	idx := cryptoRandIntn(imageCount) + 1
+	idx := cryptoRandIntn(imageCount)
+	src := carrierCache[size][idx]
 
-	path := fmt.Sprintf("images/image_%d_%dx%d.png", idx, size, size)
-	data, err := embeddedImages.ReadFile(path)
-	if err != nil {
-		panic("stego: failed to read embedded image: " + err.Error())
-	}
-
-	img, err := png.Decode(bytes.NewReader(data))
-	if err != nil {
-		panic("stego: failed to decode embedded image: " + err.Error())
-	}
-
-	// Convert to RGBA
-	bounds := img.Bounds()
-	rgba := image.NewRGBA(bounds)
-	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
-		for x := bounds.Min.X; x < bounds.Max.X; x++ {
-			rgba.Set(x, y, img.At(x, y))
-		}
-	}
-
-	return rgba
+	clone := image.NewRGBA(src.Bounds())
+	copy(clone.Pix, src.Pix)
+	return clone
 }
 
 // bestSize returns the smallest supported size that is >= dim.
