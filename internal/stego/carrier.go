@@ -36,15 +36,15 @@ var embeddedImages embed.FS
 // supportedSizes lists the available pre-rendered image dimensions.
 var supportedSizes = []int{16, 32, 64, 128, 256, 512, 1024}
 
-const imageCount = 5
+const imageCount = 9
 
 // GenerateCarrier returns an RGBA carrier image of the given dimensions by
 // loading a randomly chosen embedded photo and decoding it. The photos are
-// real images (5 variants at 7 resolutions each), so the resulting PNGs
+// real images (9 variants at 7 resolutions each), so the resulting PNGs
 // look natural to DPI systems.
 //
 // The requested (width, height) is matched to the nearest supported square
-// size (16, 32, 64, 128, 256, 512, 1024). A random image (1-5) is picked
+// size (16, 32, 64, 128, 256, 512, 1024). A random image (1-9) is picked
 // using crypto/rand.
 func GenerateCarrier(width, height int) *image.RGBA {
 	// Pick the larger dimension and find the nearest supported size

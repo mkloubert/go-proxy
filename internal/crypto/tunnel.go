@@ -30,6 +30,8 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 const (
@@ -41,14 +43,18 @@ const (
 
 	// gcmNonceSize is the standard GCM nonce size (12 bytes).
 	gcmNonceSize = 12
+
+	// compressedBit is the highest bit in the frame length header.
+	// When set, the plaintext payload was zstd-compressed before encryption.
+	compressedBit = uint32(1 << 31)
 )
 
-// EncryptedConn wraps a net.Conn with AES-256-GCM encryption.
-// It implements the net.Conn interface.
+// EncryptedConn wraps a net.Conn with AES-256-GCM encryption and optional
+// zstd compression. It implements the net.Conn interface.
 //
 // Framing protocol:
 //
-//	[4 bytes: length of nonce+ciphertext (big-endian)]
+//	[4 bytes: bit 31 = compressed flag, bits 0-30 = length of nonce+ciphertext (big-endian)]
 //	[12 bytes: nonce (prefix + counter)]
 //	[N bytes: AES-256-GCM ciphertext + 16-byte auth tag]
 type EncryptedConn struct {
@@ -59,6 +65,8 @@ type EncryptedConn struct {
 	readBuf      []byte // buffered plaintext from previous Read
 	noncePrefix  []byte
 	writeCounter uint64
+	zstdEnc      *zstd.Encoder
+	zstdDec      *zstd.Decoder
 }
 
 // NewEncryptedConn creates a new EncryptedConn wrapping the given connection
@@ -85,10 +93,22 @@ func NewEncryptedConn(conn net.Conn, key, noncePrefix []byte) (*EncryptedConn, e
 	prefix := make([]byte, NoncePrefixSize)
 	copy(prefix, noncePrefix)
 
+	zstdEnc, err := zstd.NewWriter(nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create zstd encoder: %w", err)
+	}
+
+	zstdDec, err := zstd.NewReader(nil, zstd.WithDecoderMaxMemory(MaxFrameSize*2))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create zstd decoder: %w", err)
+	}
+
 	return &EncryptedConn{
 		conn:        conn,
 		gcm:         gcm,
 		noncePrefix: prefix,
+		zstdEnc:     zstdEnc,
+		zstdDec:     zstdDec,
 	}, nil
 }
 
@@ -119,6 +139,15 @@ func (ec *EncryptedConn) Write(p []byte) (int, error) {
 
 // writeFrame encrypts a single chunk and writes the framed data atomically.
 func (ec *EncryptedConn) writeFrame(plaintext []byte) error {
+	// Try to compress the plaintext
+	compressed := ec.zstdEnc.EncodeAll(plaintext, nil)
+	isCompressed := len(compressed) < len(plaintext)
+
+	payload := plaintext
+	if isCompressed {
+		payload = compressed
+	}
+
 	// Build counter-based nonce: noncePrefix (4 bytes) || counter (8 bytes big-endian)
 	nonce := make([]byte, gcmNonceSize)
 	copy(nonce[:NoncePrefixSize], ec.noncePrefix)
@@ -127,12 +156,18 @@ func (ec *EncryptedConn) writeFrame(plaintext []byte) error {
 	binary.BigEndian.PutUint64(nonce[NoncePrefixSize:], counter)
 
 	// Encrypt: ciphertext includes the auth tag
-	ciphertext := ec.gcm.Seal(nil, nonce, plaintext, nil)
+	ciphertext := ec.gcm.Seal(nil, nonce, payload, nil)
 
 	// Assemble complete frame in a single buffer for atomic write
 	framePayloadLen := len(nonce) + len(ciphertext)
 	frame := make([]byte, frameHeaderSize+framePayloadLen)
-	binary.BigEndian.PutUint32(frame[:frameHeaderSize], uint32(framePayloadLen))
+
+	// Encode length with compression flag in bit 31
+	lenField := uint32(framePayloadLen)
+	if isCompressed {
+		lenField |= compressedBit
+	}
+	binary.BigEndian.PutUint32(frame[:frameHeaderSize], lenField)
 	copy(frame[frameHeaderSize:], nonce)
 	copy(frame[frameHeaderSize+len(nonce):], ciphertext)
 
@@ -178,7 +213,12 @@ func (ec *EncryptedConn) readFrame() ([]byte, error) {
 		return nil, fmt.Errorf("failed to read frame header: %w", err)
 	}
 
-	frameLen := binary.BigEndian.Uint32(header)
+	rawLen := binary.BigEndian.Uint32(header)
+
+	// Extract compression flag from bit 31, then mask it out for the real length
+	isCompressed := (rawLen & compressedBit) != 0
+	frameLen := rawLen &^ compressedBit
+
 	if frameLen < uint32(gcmNonceSize)+uint32(ec.gcm.Overhead()) {
 		return nil, errors.New("frame too small to contain nonce and auth tag")
 	}
@@ -205,12 +245,36 @@ func (ec *EncryptedConn) readFrame() ([]byte, error) {
 		return nil, fmt.Errorf("failed to decrypt frame: %w", err)
 	}
 
+	// Decompress if the compression flag was set
+	if isCompressed {
+		decompressed, err := ec.zstdDec.DecodeAll(plaintext, nil)
+		if err != nil {
+			return nil, fmt.Errorf("decompression failed: %w", err)
+		}
+		if len(decompressed) > MaxFrameSize {
+			return nil, fmt.Errorf("decompressed frame too large: %d bytes (max %d)", len(decompressed), MaxFrameSize)
+		}
+		return decompressed, nil
+	}
+
 	return plaintext, nil
 }
 
-// Close closes the underlying connection.
+// Close releases compression resources and closes the underlying connection.
 func (ec *EncryptedConn) Close() error {
-	return ec.conn.Close()
+	var errs []error
+	if ec.zstdEnc != nil {
+		if err := ec.zstdEnc.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("zstd encoder close: %w", err))
+		}
+	}
+	if ec.zstdDec != nil {
+		ec.zstdDec.Close()
+	}
+	if err := ec.conn.Close(); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 // LocalAddr returns the local network address of the underlying connection.
