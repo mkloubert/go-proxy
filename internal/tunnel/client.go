@@ -125,6 +125,7 @@ func (c *Client) Connect(ctx context.Context) error {
 
 		select {
 		case <-ctx.Done():
+			connCancel() // release long-lived context on failure
 			return fmt.Errorf("connection cancelled: %w", ctx.Err())
 		case <-time.After(backoff):
 		}
@@ -243,6 +244,7 @@ func (c *Client) connect() error {
 
 	session, err := yamux.Client(encConn, yamuxCfg)
 	if err != nil {
+		encConn.Close() // release zstd resources
 		wsConn.Close(websocket.StatusInternalError, "yamux failed")
 		return fmt.Errorf("yamux session creation failed: %w", err)
 	}

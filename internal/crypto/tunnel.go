@@ -67,6 +67,8 @@ type EncryptedConn struct {
 	writeCounter uint64
 	zstdEnc      *zstd.Encoder
 	zstdDec      *zstd.Decoder
+	closeOnce    sync.Once
+	closeErr     error
 }
 
 // NewEncryptedConn creates a new EncryptedConn wrapping the given connection
@@ -261,20 +263,24 @@ func (ec *EncryptedConn) readFrame() ([]byte, error) {
 }
 
 // Close releases compression resources and closes the underlying connection.
+// It is safe to call Close multiple times; only the first call performs cleanup.
 func (ec *EncryptedConn) Close() error {
-	var errs []error
-	if ec.zstdEnc != nil {
-		if err := ec.zstdEnc.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("zstd encoder close: %w", err))
+	ec.closeOnce.Do(func() {
+		var errs []error
+		if ec.zstdEnc != nil {
+			if err := ec.zstdEnc.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("zstd encoder close: %w", err))
+			}
 		}
-	}
-	if ec.zstdDec != nil {
-		ec.zstdDec.Close()
-	}
-	if err := ec.conn.Close(); err != nil {
-		errs = append(errs, err)
-	}
-	return errors.Join(errs...)
+		if ec.zstdDec != nil {
+			ec.zstdDec.Close()
+		}
+		if err := ec.conn.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		ec.closeErr = errors.Join(errs...)
+	})
+	return ec.closeErr
 }
 
 // LocalAddr returns the local network address of the underlying connection.

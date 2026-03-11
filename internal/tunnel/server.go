@@ -137,6 +137,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// Use a context derived from stopCh rather than r.Context(), because
 	// r.Context() may be canceled after WebSocket hijack completes.
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // ensures goroutine cleanup on any return path
 	go func() {
 		select {
 		case <-s.stopCh:
@@ -166,6 +167,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	yamuxSes, err := yamux.Server(encConn, yamuxCfg)
 	if err != nil {
+		encConn.Close() // release zstd resources
 		wsConn.Close(websocket.StatusInternalError, "yamux failed")
 		return
 	}
@@ -273,6 +275,16 @@ func (c *activityConn) Read(p []byte) (int, error) {
 func (c *activityConn) Write(p []byte) (int, error) {
 	c.Conn.SetWriteDeadline(time.Now().Add(c.timeout))
 	return c.Conn.Write(p)
+}
+
+// CloseWrite forwards half-close to the underlying connection if supported.
+// Without this method, embedding net.Conn hides CloseWrite from the
+// concrete type, making the halfCloser type assertion in relay() fail.
+func (c *activityConn) CloseWrite() error {
+	if hc, ok := c.Conn.(halfCloser); ok {
+		return hc.CloseWrite()
+	}
+	return nil
 }
 
 // halfCloser is implemented by connections that support closing
