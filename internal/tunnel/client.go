@@ -21,24 +21,22 @@
 package tunnel
 
 import (
-	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
-	"os"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
+	"github.com/coder/websocket"
 	"github.com/hashicorp/yamux"
 	"github.com/mkloubert/go-proxy/internal/crypto"
-	"github.com/mkloubert/go-proxy/internal/stego"
 )
 
 const (
@@ -47,292 +45,54 @@ const (
 
 	// maxBackoff is the maximum retry delay for connection attempts.
 	maxBackoff = 30 * time.Second
-
-	// maxConsecutiveErrors is the number of consecutive roundTrip failures
-	// before the StegoConn is closed.
-	maxConsecutiveErrors = 10
 )
 
-// maxStegoPayload is the maximum payload that can be embedded in the
-// largest supported carrier image (1024x1024).
-var maxStegoPayload = stego.Capacity(1024, 1024)
-
-// StegoConn implements net.Conn over HTTP POST requests with PNG steganography.
-// Write() buffers data. A background sendLoop goroutine periodically flushes
-// the buffer by encoding it into a PNG and POSTing it to the server.
-// The response PNG contains downstream data which is pushed to a read channel.
-// Read() blocks on the read channel.
-type StegoConn struct {
-	remoteURL  string       // base URL of the remote server
-	token      string       // session token from handshake
-	httpClient *http.Client // HTTP client for POST requests
-
-	// Write side: buffered data waiting to be sent
-	writeMu  sync.Mutex
-	writeBuf []byte
-
-	// Read side: channel of received data chunks
-	readCh  chan []byte
-	readBuf []byte
-	readMu  sync.Mutex
-
-	closeCh   chan struct{}
-	closeOnce sync.Once
-
-	sendInterval      time.Duration // how often to flush (e.g., 50ms)
-	consecutiveErrors int           // tracks consecutive roundTrip failures
-
-	readDeadline atomicTime
-}
-
-// Verify StegoConn implements net.Conn at compile time.
-var _ net.Conn = (*StegoConn)(nil)
-
-// Read reads data from the downstream channel. If readBuf has leftover data
-// from a previous read, it is returned first. Otherwise, Read blocks until
-// data arrives on readCh or the connection is closed. If a read deadline is
-// set, the read will fail with os.ErrDeadlineExceeded when the deadline expires.
-func (sc *StegoConn) Read(p []byte) (int, error) {
-	sc.readMu.Lock()
-	defer sc.readMu.Unlock()
-
-	// Return leftover data from a previous read
-	if len(sc.readBuf) > 0 {
-		n := copy(p, sc.readBuf)
-		sc.readBuf = sc.readBuf[n:]
-		return n, nil
-	}
-
-	deadline := sc.readDeadline.Load()
-	if !deadline.IsZero() {
-		d := time.Until(deadline)
-		if d <= 0 {
-			return 0, os.ErrDeadlineExceeded
-		}
-		timer := time.NewTimer(d)
-		defer timer.Stop()
-		select {
-		case data, ok := <-sc.readCh:
-			if !ok || len(data) == 0 {
-				return 0, io.EOF
-			}
-			n := copy(p, data)
-			if n < len(data) {
-				sc.readBuf = make([]byte, len(data)-n)
-				copy(sc.readBuf, data[n:])
-			}
-			return n, nil
-		case <-timer.C:
-			return 0, os.ErrDeadlineExceeded
-		case <-sc.closeCh:
-			return 0, io.EOF
-		}
-	}
-
-	// No deadline set — block until data arrives or connection is closed
-	select {
-	case data, ok := <-sc.readCh:
-		if !ok || len(data) == 0 {
-			return 0, io.EOF
-		}
-		n := copy(p, data)
-		if n < len(data) {
-			sc.readBuf = make([]byte, len(data)-n)
-			copy(sc.readBuf, data[n:])
-		}
-		return n, nil
-	case <-sc.closeCh:
-		return 0, io.EOF
-	}
-}
-
-// Write appends data to the write buffer. The data will be flushed by the
-// background sendLoop goroutine on the next tick.
-func (sc *StegoConn) Write(p []byte) (int, error) {
-	select {
-	case <-sc.closeCh:
-		return 0, io.ErrClosedPipe
-	default:
-	}
-
-	sc.writeMu.Lock()
-	sc.writeBuf = append(sc.writeBuf, p...)
-	sc.writeMu.Unlock()
-
-	return len(p), nil
-}
-
-// Close closes the StegoConn exactly once. It performs a best-effort final
-// flush of any buffered write data before closing.
-func (sc *StegoConn) Close() error {
-	sc.closeOnce.Do(func() {
-		// Best-effort final flush
-		sc.writeMu.Lock()
-		data := sc.writeBuf
-		sc.writeBuf = nil
-		sc.writeMu.Unlock()
-
-		if len(data) > 0 {
-			sc.roundTrip(data) //nolint:errcheck
-		}
-
-		close(sc.closeCh)
-	})
-	return nil
-}
-
-// LocalAddr returns a dummy address (pipe).
-func (sc *StegoConn) LocalAddr() net.Addr { return dummyAddr{} }
-
-// RemoteAddr returns a dummy address (pipe).
-func (sc *StegoConn) RemoteAddr() net.Addr { return dummyAddr{} }
-
-// SetDeadline sets the read deadline. Write deadlines are not meaningful
-// for StegoConn since writes are buffered and flushed asynchronously.
-func (sc *StegoConn) SetDeadline(t time.Time) error {
-	sc.readDeadline.Store(t)
-	return nil
-}
-
-// SetReadDeadline sets the read deadline.
-func (sc *StegoConn) SetReadDeadline(t time.Time) error {
-	sc.readDeadline.Store(t)
-	return nil
-}
-
-// SetWriteDeadline is a no-op for StegoConn since writes are buffered
-// and flushed asynchronously by sendLoop.
-func (sc *StegoConn) SetWriteDeadline(t time.Time) error {
-	return nil
-}
-
-// sendLoop runs as a background goroutine. On each tick it grabs the buffered
-// write data, embeds it in a PNG, POSTs it to the server, extracts the
-// response PNG, and pushes any downstream data to readCh.
-func (sc *StegoConn) sendLoop() {
-	ticker := time.NewTicker(sc.sendInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-sc.closeCh:
-			return
-		case <-ticker.C:
-			// Grab buffered write data, capped to max stego capacity
-			sc.writeMu.Lock()
-			data := sc.writeBuf
-			if len(data) > maxStegoPayload {
-				data = sc.writeBuf[:maxStegoPayload]
-				sc.writeBuf = sc.writeBuf[maxStegoPayload:]
-			} else {
-				sc.writeBuf = nil
-			}
-			sc.writeMu.Unlock()
-
-			// Even if data is empty, POST to poll for downstream data
-			if data == nil {
-				data = []byte{}
-			}
-
-			downstream, err := sc.roundTrip(data)
-			if err != nil {
-				slog.Debug("stego roundtrip error", "error", err)
-
-				// Prepend unsent data back to writeBuf so it is retried
-				if len(data) > 0 {
-					sc.writeMu.Lock()
-					sc.writeBuf = append(data, sc.writeBuf...)
-					sc.writeMu.Unlock()
-				}
-
-				sc.consecutiveErrors++
-				if sc.consecutiveErrors > maxConsecutiveErrors {
-					slog.Error("too many consecutive roundtrip errors, closing connection", "count", sc.consecutiveErrors)
-					sc.Close()
-					return
-				}
-
-				continue
-			}
-
-			sc.consecutiveErrors = 0
-
-			// Push non-empty downstream data to readCh
-			if len(downstream) > 0 {
-				select {
-				case sc.readCh <- downstream:
-				case <-sc.closeCh:
-					return
-				}
-			}
-		}
-	}
-}
-
-// roundTrip performs a single HTTP POST with steganographically encoded data
-// and returns the decoded downstream data from the response PNG.
-func (sc *StegoConn) roundTrip(data []byte) ([]byte, error) {
-	// Embed data in a PNG carrier image
-	w, h := stego.RequiredImageSize(len(data))
-	carrier := stego.GenerateCarrier(w, h)
-	pngBytes, err := stego.Embed(carrier, data)
-	if err != nil {
-		return nil, fmt.Errorf("stego embed failed: %w", err)
-	}
-
-	// Build request URL with a fresh random UUID
-	url := sc.remoteURL + "/api/v1/galleries/" + uuid.New().String() + "/pictures"
-
-	req, err := http.NewRequest("POST", url, bytes.NewReader(pngBytes))
-	if err != nil {
-		return nil, fmt.Errorf("request creation failed: %w", err)
-	}
-	req.Header.Set("Content-Type", "image/png")
-	req.Header.Set("Authorization", "Bearer "+sc.token)
-
-	// Execute the request
-	resp, err := sc.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("HTTP POST failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusCreated {
-		return nil, fmt.Errorf("unexpected response status: %d", resp.StatusCode)
-	}
-
-	// Read and decode the response PNG
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	downstream, err := stego.Extract(respBody)
-	if err != nil {
-		return nil, fmt.Errorf("stego extract failed: %w", err)
-	}
-
-	return downstream, nil
-}
-
 // Client is the local side of the tunnel. It connects to a remote tunnel
-// server over HTTP, performs a steganographic handshake, and multiplexes
-// streams via yamux over EncryptedConn over StegoConn.
+// server over WebSocket, performs an encrypted handshake, and multiplexes
+// streams via yamux over EncryptedConn.
 type Client struct {
-	remoteURL string // e.g., "http://example.com:80"
+	remoteURL string // e.g., "ws://example.com:9876"
+	wsPath    string // e.g., "/ws"
 	secret    string
 	mu        sync.RWMutex
 	session   *yamux.Session
-	stegoConn *StegoConn
+	wsConn    *websocket.Conn
 	ctx       context.Context
+	ctxCancel context.CancelFunc // cancels the long-lived connection context
 }
 
 // NewClient creates a new tunnel Client that will connect to the given
-// remote URL using the given base64-encoded secret.
-func NewClient(remoteURL, secret string) *Client {
+// remote address using the given base64-encoded secret.
+// The remoteURL can be "host:port", "ws://host:port", or "wss://host:port".
+// The wsPath is the WebSocket endpoint path on the server (e.g., "/ws").
+func NewClient(remoteURL, secret, wsPath string) *Client {
 	return &Client{
-		remoteURL: strings.TrimRight(remoteURL, "/"),
+		remoteURL: normalizeWSURL(remoteURL),
+		wsPath:    wsPath,
 		secret:    secret,
+	}
+}
+
+// normalizeWSURL converts various URL formats to a WebSocket URL.
+// Accepted formats:
+//   - "host:port" → "ws://host:port"
+//   - "http://host:port" → "ws://host:port"
+//   - "https://host:port" → "wss://host:port"
+//   - "ws://host:port" → unchanged
+//   - "wss://host:port" → unchanged
+func normalizeWSURL(raw string) string {
+	raw = strings.TrimRight(raw, "/")
+
+	switch {
+	case strings.HasPrefix(raw, "ws://") || strings.HasPrefix(raw, "wss://"):
+		return raw
+	case strings.HasPrefix(raw, "https://"):
+		return "wss://" + strings.TrimPrefix(raw, "https://")
+	case strings.HasPrefix(raw, "http://"):
+		return "ws://" + strings.TrimPrefix(raw, "http://")
+	default:
+		// Bare host:port
+		return "ws://" + raw
 	}
 }
 
@@ -340,8 +100,16 @@ func NewClient(remoteURL, secret string) *Client {
 // exponential backoff retry. It respects context cancellation.
 // After the initial connection succeeds, a background goroutine
 // monitors the session and automatically reconnects if it dies.
+//
+// The provided ctx controls the retry loop: if it is canceled, Connect
+// stops retrying and returns. The WebSocket connections use a long-lived
+// context that is only canceled when Close() is called.
 func (c *Client) Connect(ctx context.Context) error {
-	c.ctx = ctx
+	// Create a long-lived context for the WebSocket connections.
+	// This is independent of the caller's ctx (which may have a short timeout).
+	connCtx, connCancel := context.WithCancel(context.Background())
+	c.ctx = connCtx
+	c.ctxCancel = connCancel
 
 	backoff := initialBackoff
 
@@ -422,81 +190,50 @@ func (c *Client) maintainSession() {
 
 // connect performs a single connection attempt to the remote server.
 func (c *Client) connect() error {
-	httpClient := &http.Client{Timeout: 30 * time.Second}
+	dialCtx, dialCancel := context.WithTimeout(c.ctx, 30*time.Second)
+	defer dialCancel()
 
-	// Step 1: Generate handshake payload
-	hsPayload, challengePlain, keys, err := crypto.ClientHandshakePayload(c.secret)
+	// Step 1: Dial WebSocket
+	// Force HTTP/1.1 — WebSocket upgrade does not work over HTTP/2.
+	// Corporate proxies may negotiate HTTP/2 via ALPN which causes 426 errors.
+	wsURL := c.remoteURL + c.wsPath
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 15 * time.Second,
+			}).DialContext,
+			TLSClientConfig: &tls.Config{
+				NextProtos: []string{"http/1.1"}, // Prevent HTTP/2 ALPN negotiation
+			},
+			TLSHandshakeTimeout: 15 * time.Second,
+			ForceAttemptHTTP2:   false,
+		},
+	}
+	wsConn, _, err := websocket.Dial(dialCtx, wsURL, &websocket.DialOptions{
+		HTTPClient: httpClient,
+	})
 	if err != nil {
-		return fmt.Errorf("handshake payload generation failed: %w", err)
+		return fmt.Errorf("websocket dial failed: %w", err)
 	}
 
-	// Step 2: Embed handshake payload in PNG
-	w, h := stego.RequiredImageSize(len(hsPayload))
-	carrier := stego.GenerateCarrier(w, h)
-	pngBytes, err := stego.Embed(carrier, hsPayload)
+	// Disable read limit — yamux manages flow control
+	wsConn.SetReadLimit(-1)
+
+	// Step 2: Get a net.Conn from the WebSocket
+	netConn := websocket.NetConn(c.ctx, wsConn, websocket.MessageBinary)
+
+	// Step 3: Perform streaming handshake over the WebSocket net.Conn
+	encConn, err := crypto.ClientHandshake(netConn, c.secret)
 	if err != nil {
-		return fmt.Errorf("stego embed failed: %w", err)
+		wsConn.Close(websocket.StatusInternalError, "handshake failed")
+		return fmt.Errorf("handshake failed: %w", err)
 	}
 
-	// Step 3: POST to gallery API (no Authorization header = handshake)
-	url := c.remoteURL + "/api/v1/galleries/" + uuid.New().String() + "/pictures"
-	req, err := http.NewRequest("POST", url, bytes.NewReader(pngBytes))
-	if err != nil {
-		return fmt.Errorf("request creation failed: %w", err)
-	}
-	req.Header.Set("Content-Type", "image/png")
+	// Step 4: Start WebSocket ping/pong keepalive
+	go startPing(c.ctx, wsConn)
 
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("handshake request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusCreated {
-		return fmt.Errorf("handshake rejected: status %d", resp.StatusCode)
-	}
-
-	// Step 4: Get token from response
-	authHeader := resp.Header.Get("Authorization")
-	if !strings.HasPrefix(authHeader, "Bearer ") {
-		return errors.New("handshake response missing Bearer token")
-	}
-	token := strings.TrimPrefix(authHeader, "Bearer ")
-
-	// Step 5: Extract handshake response from response PNG
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("failed to read handshake response: %w", err)
-	}
-	hsResponse, err := stego.Extract(respBody)
-	if err != nil {
-		return fmt.Errorf("failed to extract handshake response: %w", err)
-	}
-
-	// Step 6: Verify handshake
-	if err := crypto.ClientVerifyHandshake(hsResponse, challengePlain, keys); err != nil {
-		return fmt.Errorf("handshake verification failed: %w", err)
-	}
-
-	// Step 7: Create StegoConn
-	sc := &StegoConn{
-		remoteURL:    c.remoteURL,
-		token:        token,
-		httpClient:   httpClient,
-		readCh:       make(chan []byte, 64),
-		closeCh:      make(chan struct{}),
-		sendInterval: 50 * time.Millisecond,
-	}
-	go sc.sendLoop()
-
-	// Step 8: Wrap with EncryptedConn (client uses ClientNoncePrefix for writes)
-	encConn, err := crypto.NewEncryptedConn(sc, keys.EncryptionKey, keys.ClientNoncePrefix)
-	if err != nil {
-		sc.Close()
-		return fmt.Errorf("encrypted connection failed: %w", err)
-	}
-
-	// Step 9: Create yamux client session
+	// Step 5: Create yamux client session
 	yamuxCfg := yamux.DefaultConfig()
 	yamuxCfg.AcceptBacklog = 128
 	yamuxCfg.StreamCloseTimeout = 60 * time.Second
@@ -506,22 +243,23 @@ func (c *Client) connect() error {
 
 	session, err := yamux.Client(encConn, yamuxCfg)
 	if err != nil {
-		sc.Close()
+		wsConn.Close(websocket.StatusInternalError, "yamux failed")
 		return fmt.Errorf("yamux session creation failed: %w", err)
 	}
 
-	// Step 10: Store new session, close old one if it exists
+	// Step 6: Store new session, close old one if it exists
 	c.mu.Lock()
 	oldSession := c.session
+	oldWsConn := c.wsConn
 	c.session = session
-	if c.stegoConn != nil {
-		c.stegoConn.Close()
-	}
-	c.stegoConn = sc
+	c.wsConn = wsConn
 	c.mu.Unlock()
 
 	if oldSession != nil {
 		oldSession.Close()
+	}
+	if oldWsConn != nil {
+		oldWsConn.Close(websocket.StatusGoingAway, "reconnecting")
 	}
 
 	return nil
@@ -570,10 +308,15 @@ func (c *Client) OpenStream(target string) (net.Conn, error) {
 	return stream, nil
 }
 
-// Close closes the tunnel client, its yamux session, and the underlying StegoConn.
+// Close closes the tunnel client, its yamux session, and the underlying WebSocket.
 func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	// Cancel the long-lived context to stop reconnection and close WebSocket NetConns
+	if c.ctxCancel != nil {
+		c.ctxCancel()
+	}
 
 	var firstErr error
 
@@ -584,11 +327,11 @@ func (c *Client) Close() error {
 		c.session = nil
 	}
 
-	if c.stegoConn != nil {
-		if err := c.stegoConn.Close(); err != nil && firstErr == nil {
+	if c.wsConn != nil {
+		if err := c.wsConn.Close(websocket.StatusNormalClosure, "closing"); err != nil && firstErr == nil {
 			firstErr = err
 		}
-		c.stegoConn = nil
+		c.wsConn = nil
 	}
 
 	return firstErr

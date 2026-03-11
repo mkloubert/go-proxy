@@ -45,9 +45,7 @@ var testSecret = base64.StdEncoding.EncodeToString([]byte("my-32-byte-secret-key
 // tcpAddrConn wraps a net.Conn and overrides LocalAddr/RemoteAddr to return
 // valid *net.TCPAddr values. This is needed because the go-socks5 library
 // requires the dialed connection's LocalAddr() to be a *net.TCPAddr when
-// building the SOCKS5 success reply. The yamux streams returned by
-// tunnel.Client.OpenStream() have a dummyAddr that is not a *net.TCPAddr,
-// causing the SOCKS5 server to reply with "address type not supported".
+// building the SOCKS5 success reply.
 type tcpAddrConn struct {
 	net.Conn
 }
@@ -78,8 +76,6 @@ func startTargetHTTPServer(t *testing.T) (net.Listener, string) {
 
 	t.Cleanup(func() { srv.Close() })
 
-	// Return the underlying listener (nil, since httptest manages it)
-	// and the host:port address for dialing.
 	return nil, u.Host
 }
 
@@ -112,21 +108,22 @@ func startEchoServer(t *testing.T) (net.Listener, string) {
 }
 
 // startTunnelRemote starts a tunnel server wrapped in httptest.NewServer.
-// It returns the base URL of the HTTP test server (e.g., "http://127.0.0.1:xxxxx").
+// It returns the WebSocket URL of the HTTP test server (e.g., "ws://127.0.0.1:xxxxx").
 func startTunnelRemote(t *testing.T, secret string) string {
 	t.Helper()
 
 	srv := tunnel.NewServer(secret)
 	srv.SetAllowPrivateIPs(true)
 
-	httpSrv := httptest.NewServer(srv.Handler())
+	httpSrv := httptest.NewServer(srv.Handler("/ws"))
 
 	t.Cleanup(func() {
 		srv.Close()
 		httpSrv.Close()
 	})
 
-	return httpSrv.URL
+	// Convert http:// to ws:// for the tunnel client
+	return strings.Replace(httpSrv.URL, "http://", "ws://", 1)
 }
 
 // startTunnelClient creates a tunnel client, connects it to the remote URL,
@@ -134,7 +131,7 @@ func startTunnelRemote(t *testing.T, secret string) string {
 func startTunnelClient(t *testing.T, remoteURL, secret string) *tunnel.Client {
 	t.Helper()
 
-	client := tunnel.NewClient(remoteURL, secret)
+	client := tunnel.NewClient(remoteURL, secret, "/ws")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -177,8 +174,8 @@ func startLocalProxy(t *testing.T, client *tunnel.Client) string {
 
 // TestIntegrationHTTPProxy exercises the full path:
 //
-//	HTTP client -> local proxy -> yamux -> EncryptedConn -> StegoConn ->
-//	HTTP POST/Response -> tunnel server -> target HTTP server
+//	HTTP client -> local proxy -> yamux -> EncryptedConn -> WebSocket ->
+//	tunnel server -> target HTTP server
 func TestIntegrationHTTPProxy(t *testing.T) {
 	// 1. Start target HTTP server
 	_, targetAddr := startTargetHTTPServer(t)
@@ -188,9 +185,6 @@ func TestIntegrationHTTPProxy(t *testing.T) {
 
 	// 3. Connect tunnel client
 	client := startTunnelClient(t, remoteURL, testSecret)
-
-	// Allow yamux session to stabilize
-	time.Sleep(500 * time.Millisecond)
 
 	// 4. Start local proxy
 	proxyAddr := startLocalProxy(t, client)
@@ -230,8 +224,8 @@ func TestIntegrationHTTPProxy(t *testing.T) {
 
 // TestIntegrationHTTPSConnect exercises the HTTPS CONNECT tunnel path:
 //
-//	CONNECT request -> local proxy -> yamux -> EncryptedConn -> StegoConn ->
-//	HTTP POST/Response -> tunnel server -> echo server
+//	CONNECT request -> local proxy -> yamux -> EncryptedConn -> WebSocket ->
+//	tunnel server -> echo server
 func TestIntegrationHTTPSConnect(t *testing.T) {
 	// 1. Start echo server
 	_, echoAddr := startEchoServer(t)
@@ -239,9 +233,6 @@ func TestIntegrationHTTPSConnect(t *testing.T) {
 	// 2. Start tunnel remote + client + proxy
 	remoteURL := startTunnelRemote(t, testSecret)
 	client := startTunnelClient(t, remoteURL, testSecret)
-
-	// Allow yamux session to stabilize
-	time.Sleep(500 * time.Millisecond)
 
 	proxyAddr := startLocalProxy(t, client)
 
@@ -303,8 +294,8 @@ func TestIntegrationHTTPSConnect(t *testing.T) {
 
 // TestIntegrationSOCKS5 exercises the SOCKS5 tunnel path:
 //
-//	SOCKS5 client -> local proxy -> yamux -> EncryptedConn -> StegoConn ->
-//	HTTP POST/Response -> tunnel server -> echo server
+//	SOCKS5 client -> local proxy -> yamux -> EncryptedConn -> WebSocket ->
+//	tunnel server -> echo server
 func TestIntegrationSOCKS5(t *testing.T) {
 	// 1. Start echo server
 	_, echoAddr := startEchoServer(t)
@@ -312,9 +303,6 @@ func TestIntegrationSOCKS5(t *testing.T) {
 	// 2. Start tunnel remote + client + proxy
 	remoteURL := startTunnelRemote(t, testSecret)
 	client := startTunnelClient(t, remoteURL, testSecret)
-
-	// Allow yamux session to stabilize
-	time.Sleep(500 * time.Millisecond)
 
 	proxyAddr := startLocalProxy(t, client)
 

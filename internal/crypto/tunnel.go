@@ -302,5 +302,13 @@ func (ec *EncryptedConn) SetWriteDeadline(t time.Time) error {
 	return ec.conn.SetWriteDeadline(t)
 }
 
+// CloseWrite signals that no more data will be written.
+// Since WebSocket connections don't support TCP half-close,
+// this closes the entire underlying connection to unblock
+// any pending reads on the other direction.
+func (ec *EncryptedConn) CloseWrite() error {
+	return ec.conn.Close()
+}
+
 // Verify EncryptedConn implements net.Conn at compile time.
 var _ net.Conn = (*EncryptedConn)(nil)

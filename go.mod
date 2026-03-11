@@ -3,7 +3,7 @@ module github.com/mkloubert/go-proxy
 go 1.25.1
 
 require (
-	github.com/google/uuid v1.6.0
+	github.com/coder/websocket v1.8.14
 	github.com/hashicorp/yamux v0.1.2
 	github.com/klauspost/compress v1.18.4
 	github.com/oschwald/geoip2-golang v1.13.0

@@ -21,7 +21,6 @@
 package tunnel
 
 import (
-	"bytes"
 	"encoding/base64"
 	"io"
 	"net"
@@ -83,7 +82,7 @@ func startTunnelHTTPServer(t *testing.T, secret string) (*httptest.Server, func(
 	srv := NewServer(secret)
 	srv.SetAllowPrivateIPs(true)
 
-	ts := httptest.NewServer(srv.Handler())
+	ts := httptest.NewServer(srv.Handler("/ws"))
 
 	cleanup := func() {
 		srv.Close()
@@ -101,7 +100,7 @@ func startTunnelHTTPServerRaw(t *testing.T, secret string) (*Server, *httptest.S
 	srv := NewServer(secret)
 	srv.SetAllowPrivateIPs(true)
 
-	ts := httptest.NewServer(srv.Handler())
+	ts := httptest.NewServer(srv.Handler("/ws"))
 
 	cleanup := func() {
 		srv.Close()
@@ -117,20 +116,22 @@ func TestServerHandlerRouting(t *testing.T) {
 	srv := NewServer(secret)
 	defer srv.Close()
 
-	handler := srv.Handler()
+	handler := srv.Handler("/ws")
 
-	// Test that GET requests return 405 or similar (method not allowed)
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/galleries/test-uuid/pictures", nil)
+	// Test that GET request to /ws returns non-404 (WebSocket upgrade fails
+	// gracefully but the route exists)
+	req := httptest.NewRequest(http.MethodGet, "/ws", nil)
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 
-	// Go 1.22+ ServeMux returns 405 for wrong method
-	if w.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("expected 405 for GET, got %d", w.Code)
+	// WebSocket upgrade will fail in a non-WebSocket context, but route exists.
+	// The handler should not return 404 for the correct path.
+	if w.Code == http.StatusNotFound {
+		t.Fatal("expected /ws route to exist")
 	}
 
-	// Test that POST to wrong path returns 404
-	req = httptest.NewRequest(http.MethodPost, "/api/v1/wrong/path", nil)
+	// Test that request to wrong path returns 404
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/wrong/path", nil)
 	w = httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 
@@ -139,22 +140,26 @@ func TestServerHandlerRouting(t *testing.T) {
 	}
 }
 
-func TestServerHandleInvalidPNG(t *testing.T) {
-	secret := makeTestSecret(0xBB)
+func TestNormalizeWSURL(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"example.com:9876", "ws://example.com:9876"},
+		{"ws://example.com:9876", "ws://example.com:9876"},
+		{"wss://example.com:9876", "wss://example.com:9876"},
+		{"http://example.com:80", "ws://example.com:80"},
+		{"https://example.com:443", "wss://example.com:443"},
+		{"http://example.com:80/", "ws://example.com:80"},
+		{"example.com:9876/", "ws://example.com:9876"},
+	}
 
-	srv := NewServer(secret)
-	defer srv.Close()
-
-	handler := srv.Handler()
-
-	// Send invalid PNG data — should return 404 (stego.Extract fails)
-	garbage := []byte("this is not a valid PNG file")
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/galleries/test-uuid/pictures", bytes.NewReader(garbage))
-	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
-
-	// Invalid PNG will fail stego.Extract
-	if w.Code != http.StatusNotFound {
-		t.Fatalf("expected 404 for invalid PNG, got %d", w.Code)
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			result := normalizeWSURL(tt.input)
+			if result != tt.expected {
+				t.Errorf("normalizeWSURL(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
 	}
 }

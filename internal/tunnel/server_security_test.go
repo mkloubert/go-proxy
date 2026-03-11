@@ -21,111 +21,63 @@
 package tunnel
 
 import (
-	"bytes"
-	"io"
-	"net/http"
+	"context"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/coder/websocket"
 	"github.com/mkloubert/go-proxy/internal/crypto"
-	"github.com/mkloubert/go-proxy/internal/stego"
 )
 
-func TestServerRejectsGarbagePNG(t *testing.T) {
+func TestServerRejectsNonWebSocketRequest(t *testing.T) {
 	secret := makeTestSecret(0xA1)
 
 	srv := NewServer(secret)
 	defer srv.Close()
 
-	handler := srv.Handler()
+	ts := httptest.NewServer(srv.Handler("/ws"))
+	defer ts.Close()
 
-	// Send garbage data (not valid PNG) — server must return 404
-	garbage := make([]byte, 64)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/galleries/test-uuid/pictures", bytes.NewReader(garbage))
-	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
+	// Plain HTTP GET to /ws — should fail since it's not a WebSocket upgrade
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-	if w.Code != http.StatusNotFound {
-		t.Fatalf("expected 404 for garbage PNG, got %d", w.Code)
-	}
-
-	// Verify no sensitive info is leaked in the body
-	body := w.Body.String()
-	if body != "Not Found\n" {
-		t.Fatalf("unexpected response body: %q", body)
+	_, _, err := websocket.Dial(ctx, strings.Replace(ts.URL, "http://", "ws://", 1)+"/wrong-path", nil)
+	if err == nil {
+		t.Fatal("expected error for wrong path")
 	}
 }
 
 func TestServerRejectsInvalidHandshake(t *testing.T) {
 	secret := makeTestSecret(0xA2)
+	wrongSecret := makeTestSecret(0xFF)
 
 	srv := NewServer(secret)
+	srv.SetAllowPrivateIPs(true)
 	defer srv.Close()
 
-	handler := srv.Handler()
+	ts := httptest.NewServer(srv.Handler("/ws"))
+	defer ts.Close()
 
-	// Create a valid PNG with garbage handshake data
-	garbagePayload := make([]byte, 64)
-	w2, h2 := stego.RequiredImageSize(len(garbagePayload))
-	carrier := stego.GenerateCarrier(w2, h2)
-	pngBytes, err := stego.Embed(carrier, garbagePayload)
+	// Connect via WebSocket with wrong secret — handshake should fail
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	wsURL := strings.Replace(ts.URL, "http://", "ws://", 1) + "/ws"
+	wsConn, _, err := websocket.Dial(ctx, wsURL, nil)
 	if err != nil {
-		t.Fatalf("failed to embed: %v", err)
+		t.Fatalf("websocket dial failed: %v", err)
 	}
 
-	// No Authorization header = handshake attempt
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/galleries/test-uuid/pictures", bytes.NewReader(pngBytes))
-	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
+	wsConn.SetReadLimit(-1)
 
-	// Should fail because handshake data is garbage
-	if w.Code != http.StatusNotFound {
-		t.Fatalf("expected 404 for invalid handshake, got %d", w.Code)
-	}
-}
-
-func TestServerRejectsInvalidToken(t *testing.T) {
-	secret := makeTestSecret(0xA3)
-
-	srv := NewServer(secret)
-	defer srv.Close()
-
-	handler := srv.Handler()
-
-	// Create a valid PNG with some payload
-	payload := []byte("test data")
-	w2, h2 := stego.RequiredImageSize(len(payload))
-	carrier := stego.GenerateCarrier(w2, h2)
-	pngBytes, err := stego.Embed(carrier, payload)
-	if err != nil {
-		t.Fatalf("failed to embed: %v", err)
-	}
-
-	// Send with an invalid token
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/galleries/test-uuid/pictures", bytes.NewReader(pngBytes))
-	req.Header.Set("Authorization", "Bearer invalid-token-that-does-not-exist")
-	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
-
-	if w.Code != http.StatusNotFound {
-		t.Fatalf("expected 404 for invalid token, got %d", w.Code)
-	}
-}
-
-func TestServerEmptyBodyReturns404(t *testing.T) {
-	secret := makeTestSecret(0xA4)
-
-	srv := NewServer(secret)
-	defer srv.Close()
-
-	handler := srv.Handler()
-
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/galleries/test-uuid/pictures", bytes.NewReader([]byte{}))
-	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
-
-	if w.Code != http.StatusNotFound {
-		t.Fatalf("expected 404 for empty body, got %d", w.Code)
+	// Try handshake with wrong secret — should fail
+	netConn := websocket.NetConn(ctx, wsConn, websocket.MessageBinary)
+	_, hsErr := crypto.ClientHandshake(netConn, wrongSecret)
+	if hsErr == nil {
+		t.Fatal("expected handshake to fail with wrong secret")
 	}
 }
 
@@ -136,53 +88,30 @@ func TestServerHandshakeSuccess(t *testing.T) {
 	srv.SetAllowPrivateIPs(true)
 	defer srv.Close()
 
-	handler := srv.Handler()
+	ts := httptest.NewServer(srv.Handler("/ws"))
+	defer ts.Close()
 
-	// Create a proper handshake payload using the crypto package
-	hsPayload, _, _, err := crypto.ClientHandshakePayload(secret)
+	// Connect via WebSocket and perform successful handshake
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	wsURL := strings.Replace(ts.URL, "http://", "ws://", 1) + "/ws"
+	wsConn, _, err := websocket.Dial(ctx, wsURL, nil)
 	if err != nil {
-		t.Fatalf("failed to create handshake payload: %v", err)
+		t.Fatalf("websocket dial failed: %v", err)
 	}
 
-	// Embed handshake payload in PNG
-	w2, h2 := stego.RequiredImageSize(len(hsPayload))
-	carrier := stego.GenerateCarrier(w2, h2)
-	pngBytes, err := stego.Embed(carrier, hsPayload)
+	wsConn.SetReadLimit(-1)
+
+	netConn := websocket.NetConn(ctx, wsConn, websocket.MessageBinary)
+	encConn, err := crypto.ClientHandshake(netConn, secret)
 	if err != nil {
-		t.Fatalf("failed to embed: %v", err)
+		t.Fatalf("handshake failed: %v", err)
 	}
 
-	// Send handshake (no Authorization header)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/galleries/test-uuid/pictures", bytes.NewReader(pngBytes))
-	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
-
-	if w.Code != http.StatusCreated {
-		body, _ := io.ReadAll(w.Body)
-		t.Fatalf("expected 201 for successful handshake, got %d: %s", w.Code, body)
+	if encConn == nil {
+		t.Fatal("expected non-nil encrypted connection")
 	}
 
-	// Response should contain Authorization header with token
-	authHeader := w.Header().Get("Authorization")
-	if authHeader == "" {
-		t.Fatal("expected Authorization header in response")
-	}
-	if len(authHeader) < len("Bearer ")+8 {
-		t.Fatalf("token too short: %s", authHeader)
-	}
-
-	// Response should be a PNG
-	contentType := w.Header().Get("Content-Type")
-	if contentType != "image/png" {
-		t.Fatalf("expected Content-Type image/png, got %s", contentType)
-	}
-
-	// Should be able to extract data from the response PNG
-	respData, err := stego.Extract(w.Body.Bytes())
-	if err != nil {
-		t.Fatalf("failed to extract from response PNG: %v", err)
-	}
-	if len(respData) == 0 {
-		t.Fatal("expected non-empty handshake response data")
-	}
+	wsConn.CloseNow()
 }

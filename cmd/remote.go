@@ -28,6 +28,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/mkloubert/go-proxy/internal/crypto"
 	"github.com/mkloubert/go-proxy/internal/security"
@@ -60,14 +61,19 @@ environment variable (base64-encoded).`,
 
 		// 2. Read flags
 		port, _ := cmd.Flags().GetInt("port")
+		wsPath, _ := cmd.Flags().GetString("path")
 
 		// 3. Create tunnel server and HTTP server
 		srv := tunnel.NewServer(secret)
 		srv.SetIPFilter(ipFilter)
 
 		httpServer := &http.Server{
-			Addr:    fmt.Sprintf("0.0.0.0:%d", port),
-			Handler: srv.Handler(),
+			Addr:              fmt.Sprintf("0.0.0.0:%d", port),
+			Handler:           srv.Handler(wsPath),
+			ReadHeaderTimeout: 10 * time.Second, // Limit time to read HTTP headers
+			ReadTimeout:       0,                // No read timeout — WebSocket connections are long-lived
+			WriteTimeout:      0,                // No write timeout — WebSocket connections are long-lived
+			IdleTimeout:       0,                // No idle timeout — ping/pong handles keepalive
 		}
 
 		// 4. Graceful shutdown
@@ -82,7 +88,7 @@ environment variable (base64-encoded).`,
 		}()
 
 		// 5. Start HTTP server
-		slog.Info("remote server started", "address", httpServer.Addr)
+		slog.Info("remote server started", "address", httpServer.Addr, "path", wsPath)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			return err
 		}
@@ -92,6 +98,16 @@ environment variable (base64-encoded).`,
 
 func init() {
 	remoteCmd.Flags().IntP("port", "p", 9876, "Port for the remote server to listen on")
+	remoteCmd.Flags().String("path", envOrDefault("GOPROXY_TUNNEL_PATH", "/ws"), "WebSocket endpoint path")
 
 	rootCmd.AddCommand(remoteCmd)
+}
+
+// envOrDefault returns the value of the environment variable key,
+// or fallback if the variable is empty or unset.
+func envOrDefault(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }

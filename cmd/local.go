@@ -55,9 +55,10 @@ environment variable (base64-encoded).`,
 		port, _ := cmd.Flags().GetInt("port")
 		connectTo, _ := cmd.Flags().GetString("connect-to")
 		bindAddr, _ := cmd.Flags().GetString("bind")
+		wsPath, _ := cmd.Flags().GetString("path")
 
 		// 3. Create tunnel client and connect
-		client := tunnel.NewClient(connectTo, secret)
+		client := tunnel.NewClient(connectTo, secret, wsPath)
 		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer cancel()
 
@@ -103,7 +104,8 @@ environment variable (base64-encoded).`,
 func init() {
 	localCmd.Flags().IntP("port", "p", 8080, "Port for the local proxy to listen on")
 	localCmd.Flags().StringP("bind", "b", "127.0.0.1", "Address to bind the local proxy to")
-	localCmd.Flags().StringP("connect-to", "c", "", "Remote server URL (e.g., http://example.com:80)")
+	localCmd.Flags().StringP("connect-to", "c", "", "Remote server address (e.g., example.com:9876 or ws://example.com:9876)")
+	localCmd.Flags().String("path", envOrDefault("GOPROXY_TUNNEL_PATH", "/ws"), "WebSocket endpoint path (must match remote)")
 	_ = localCmd.MarkFlagRequired("connect-to")
 
 	rootCmd.AddCommand(localCmd)
